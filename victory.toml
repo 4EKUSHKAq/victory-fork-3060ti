@@ -1,0 +1,16 @@
+# Local configuration for the RTX 3060 Ti machine (coolfox-rtx branch).
+# Copied from victory.example.toml; every path is OUTSIDE the repository.
+
+[paths]
+# Our own dump of the title.     env: VICTORY_GAME_DIR
+game_dir = 'C:\GTA6_Files'
+
+# Derived data (the pareto-residency preset's own cache folder).
+# Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
+cache_dir = 'C:\Users\4EKUSHKA\AppData\Local\VIctory\cache-pareto'
+
+# What titles save (persistent local storage), kept apart from the cache.
+data_dir = 'C:\Users\4EKUSHKA\AppData\Local\victory\data'
+
+# Other Xbox Series titles used to test platform-level code.
+test_titles = []

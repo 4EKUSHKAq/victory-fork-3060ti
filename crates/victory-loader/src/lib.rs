@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+pub mod force_1080p;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]

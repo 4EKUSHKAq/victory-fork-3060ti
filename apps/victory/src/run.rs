@@ -102,6 +102,14 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The output size and the render scale (`VICTORY_FORCE_1080P=1`: output
+    // 1920x1080 and the title's own render scale 1.0, so the title itself makes
+    // its back buffers and render targets 1920x1080; `VICTORY_OUTPUT` and
+    // `VICTORY_RENDER_SCALE` for their own values): title code changed at load,
+    // each place compared byte for byte first (`force_1080p`).
+    let image_size = image.info().size_of_image as usize;
+    // SAFETY: the image stays mapped and nothing of it has run yet.
+    unsafe { victory_loader::force_1080p::apply_asked(image.base(), image_size) };
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

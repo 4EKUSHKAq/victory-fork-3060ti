@@ -1,10 +1,23 @@
 # HANDOFF — текущее состояние работ
 
-Обновлено: 2026-11-26, 12:55 (Asia/Yekaterinburg)
-Ветка: `visual-and-nvidia-fixes` (от `perf-and-upstream-fixes`; `master` не правился)
-Запушена в приватный бэкап `myfork` = https://github.com/4EKUSHKAq/victory-fork-3060ti
+Обновлено: 2026-11-26, 14:50 (Asia/Yekaterinburg)
+Текущая ветка: `coolfox-rtx` (от `coolfox/main` = `codec-d/cool_fox` @ `f4b48ad`); наша прежняя ветка
+`visual-and-nvidia-fixes` @ `4133084` **не тронута** и лежит в `myfork`.
+Обе в приватном бэкапе `myfork` = https://github.com/4EKUSHKAq/victory-fork-3060ti
 (вместе с `perf-and-upstream-fixes` и `master`).
-§18: мониторинг всех 6 звёзд GitHub (за 48 ч — 2085 коммитов и 5849 PR), затем perf-батч **без сброса
+§20: два тестовых прогона coolfox-rtx на 3060 Ti 8 ГБ (авторский `.cmd` = Series S и диагностический
+Series X). Итог: **Series S даёт чёрный 3D-экран** (two-plane compose), Series X рисует картинку,
+ambient работает (интерьер не чёрный), пересвет умеренный, но FPS **в 2–3 раза ниже нашей ветки**
+(медиана 2–3 против 6, GPU-время 48–241 мс против 5 мс) и 3 compute-шейдера дропнуты (2 из них водные,
+которые у нас переведены). Рекомендация: основная линия — `visual-and-nvidia-fixes`, coolfox-rtx —
+экспериментальная, только с `--console series-x`.
+§19: подключён публичный форк `codec-d/cool_fox` (667★, 627 коммитов, отдельная история), три
+субагента разобрали лаунчер/pareto-пресет, перф-коммиты и свет; выбран **Путь А** — ветка `coolfox-rtx`
+от их main (перенос их 900–1000-строчных модулей в нашу ветку нереален: 9/9 `git apply --check` = FAIL).
+Добавлены `victory.toml`, `AGENTS.md`, `HANDOFF.md`; `cargo check --workspace --locked` exit 0, релиз
+1 м 05 с, кэш отдельной папки `cache-pareto` прогрет за 294,3 с (25 663 переведено, 226 не переводятся:
+195 GS + 26 wave32 + 5 shadow-mask). Команда запуска — §19.5.
+§18 (ветка `visual-and-nvidia-fixes`): мониторинг всех 6 звёзд GitHub (за 48 ч — 2085 коммитов и 5849 PR), затем perf-батч **без сброса
 кэша шейдеров**: #1237+#1245 (`VICTORY_LOOKUP_CACHE`), #1227 (`VICTORY_CARD_SYNC_BATCH`), host-часть
 #1224 (`VICTORY_FILL_HOT`/`VICTORY_BURY_ASIDE`), VRAM-пара #1240+#1258 (`VICTORY_TEXTURE_MAX_DIM`,
 `VICTORY_DYNAMIC_SLOTS`, `VICTORY_BIND_CACHE`, `VICTORY_RAM_TRIM_MB`) и свежий #1269 (94 % под текстуры
@@ -36,6 +49,8 @@
 | 16 | Бэкап-репозиторий `4EKUSHKAq/victory-fork-3060ti` (private) + разведка fxceless/victory-fork, Marvisak/VIctory, xcl-dev/xcl и аудит наших 254 непереведённых шейдеров/HDR-флагов | готово: репозиторий создан, `myfork` добавлен, `perf-and-upstream-fixes` и `master` запушены; найдены конкретные кандидаты (bloom/movreld-фикс, #2268, NVIDIA wave64 #1249, BVH-путь, perf-серии), всё с пометкой влияния на кэш шейдеров; код не менялся — §16 |
 | 17 | Ветка `visual-and-nvidia-fixes`: 3 субагента-разведчика, затем порт #2268 (user-data/вокселизация) и NVIDIA-слоя (#1176 + control-flow #1249); bloom f342dcfcfb не переносился (no-op) | готово: `check` после каждого шага exit 0, полный `test` зелёный, релиз 43,03 с, кэш прогрет 249,4 с (25 637 переводов), `--list`: **254→57** (исправлено 197, новых 0), DXIL compute +2 — §17 |
 | 18 | Мониторинг 6 звёздных репозиториев + perf-батч без сброса кэша: #1237+#1245, #1227, host-часть #1224, VRAM-пара #1240+#1258, свежий #1269; #1178 отклонён | готово: `check` после каждого из 6 шагов exit 0, полный `test` зелёный (gpu 188 вместо 184), релиз 30,88 с, кэш шейдеров **не сброшен** (`0 translated now, 25637 in the cache already`, 4,7 с) — §18 |
+| 19 | Публичный форк `codec-d/cool_fox`: remote+fetch, 3 субагента (лаунчер/pareto, перф, свет/шейдеры), выбор Пути А, ветка `coolfox-rtx`, сборка и прогрев под их транслятор | готово: `check --locked` exit 0, релиз 1 м 05 с (exe 9 979 904 Б), кэш `cache-pareto` прогрет 294,3 с (25 663 переведено, 226 не переводятся), `config` exit 0; запушено в `myfork` — §19 |
+| 20 | Тестовые прогоны coolfox-rtx на 3060 Ti: авторский `.cmd` (Series S, 340 с) и диагностический Series X (320 с) с реальными нажатиями, скриншотами и nvidia-smi | готово: Series S = **чёрный 3D-экран** (two-plane compose), Series X = картинка + ambient; FPS медиана 2–3 у coolfox против **6** у нас, VRAM пик 7977/8192, 3 compute-шейдера дропнуты (2 водных у нас переведены); штатное закрытие не сработало — §20 |
 
 ## Окружение (проверено 2026-11-26)
 
@@ -1361,3 +1376,258 @@ VRAM — режет старшие mip'ы; при всё ещё >95 % VRAM ст�
 - Сырые данные мониторинга: `C:\GTA6_Port\recon\stars\` (`stars-report.md`, `commits-48h.tsv`,
   `pr-merged-48h.tsv`, `pr-open-48h.tsv`, `pulls-all.tsv`, `topic-A/B/C-*.txt`, `commits-shader-path.tsv`);
 - Логи: `upstream\check-s1..s5*.log`, `upstream\test-after-perf.log`, `upstream\build-after-perf.log`.
+
+## §19. Публичный форк `codec-d/cool_fox` и ветка `coolfox-rtx` (2026-11-26)
+
+Задание: подключить `https://github.com/codec-d/cool_fox.git` (якобы «топовый форк на базе fxceless»),
+тремя параллельными субагентами разобрать лаунчер/пресет `pareto-residency`, перф-коммиты и свет,
+затем главным агентом сравнить **Путь А** (ветка от `coolfox/main` + наши файлы) и **Путь Б** (перенос
+их коммитов в нашу ветку), выбрать надёжный, собрать, прогреть кэш, запушить в `myfork` и дать команду.
+
+### 19.1. Что такое cool_fox на самом деле
+
+| Факт | Значение |
+|---|---|
+| Метаданные | создан 2026-11-26 04:16Z, `isFork=false`, **667★ / 188 форков**, 1 ветка `main`, 1 тег `pareto-residency-37a410b1` = `f4b48ad` |
+| История | **627 коммитов, отдельная** (`git merge-base HEAD coolfox/main` пуст) → cherry-pick невозможен, только сравнение содержимого |
+| Происхождение | форк `avatarmanz/VIctory-7900XTX` (тот же репозиторий из §18.1), который сам — линия fxceless; сверху сведены Marvisak/Seenax/uwucammie/DexNom/Belobug/romainhedouin |
+| Дерево | 250 файлов, полноценный workspace (`crates/*`, `apps/*`, `xtask`), **бинарников в git нет**; toolchain `1.98.1` msvc — совпадает с нашей машиной |
+| Лаунчеры | `Play-VIctory.cmd` (41 строка, только аргумент `pareto-residency`) и `scripts/play.ps1` (`-Safe -RayTracing -Build`) |
+| Безопасность | **чисто**: 0 совпадений по `Invoke-WebRequest/BitsTransfer/DownloadString/bitsadmin/certutil/schtasks/HKLM/HKCU/FromBase64String/EncodedCommand`, `https?://` в скриптах 0; только `set "VICTORY_*=..."` + запуск локального exe |
+
+Важно: **заявления «~25 FPS на NVIDIA» в репозитории нет**. Их же замеры: RX 7900 XTX 24 ГиБ — цель
+«30 fps, пока не достигнута», 13–22 fps в прологе; **RTX 5090 / 32 ГБ RAM** — медиана `54.3 мс` (~18,4 fps),
+лучшие интервалы ~20 fps; `README-fxeless` про **RTX 4070 12 ГБ** — «not playable yet, **2.5–4 fps**».
+Т.е. цифру 25 нельзя переносить на нашу 3060 Ti даже как ориентир; зато их «32 GB RAM residency budgets»
+(коммит `8cc31ab`) — ровно наш профиль (32 ГБ ОЗУ).
+
+### 19.2. Пресет `pareto-residency` (то, что реально ставит лаунчер)
+
+Раннер: `victory-3d-rtx-pareto-residency.exe` в корне, иначе `target\release\victory.exe`.
+Команда: `run "<VICTORY_GAME_DIR>\game_scarlett_master.exe" --console series-s --execute`.
+Все присваивания — `if not defined`, т.е. наш env имеет приоритет.
+
+| Группа | Переменные |
+|---|---|
+| Консоль/память | `--console series-s` (только CLI; `VICTORY_CONSOLE` не существует). Series S: title-memory 0 + **7776 MiB** (Series X: 10 GiB GPU-optimal + 3.5 GiB standard ≈ 13.5 ГиБ). `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_UPLOAD_AHEAD=1` |
+| Свет | `VICTORY_AMBIENT=0.8`, `VICTORY_AMBIENT_AIR=1.5` |
+| Скорость | `VICTORY_THIN=1`, `VICTORY_CARD_STEPS=2`, `VICTORY_RELAY=2`, `VICTORY_RELAY_COPY=1`, `VICTORY_JOIN_PARTS=8`, `VICTORY_JOIN_COPIES=1`, `VICTORY_INDIRECT_BATCH=2`, `VICTORY_INDIRECT_WINDOW=1`, `VICTORY_MAP_THREADS=1`, `VICTORY_CARD_AWAKE=1`, `VICTORY_SHOW_AFTER=1`, `VICTORY_WIDE_BACK=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_TEXTURE_NO_WAIT=1` |
+| Кэш/логи | `VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto`, `VICTORY_LOG=warn` |
+
+Под 8 ГБ VRAM отдельного флага нет: форк **сам** режет лимиты карточных копий по DXGI Budget
+(≤12 ГиБ → min 16 MiB / max 512 MiB; 16 ГиБ → 4/2048; ≥20 ГиБ → 1/мин(budget/4, 8192) МиБ), плюс
+резиденция под 32 ГБ ОЗУ (давление 3 ГиБ RAM / 4 ГиБ commit, critical <1536 МиБ commit, staging
+16/32 МиБ за кадр, prefetch off <4 ГиБ commit). У **нашего** дерева `card_limits` был фиксирован
+`1 MiB / 1024 MiB` — на 8-ГБ карте это вдвое больше копий, чем у форка.
+
+`VICTORY_AMBIENT` — **не «включение света»**, а стенд-ин непрямого света: после
+`CS_ScreenProbes_TemporalResolve` подменяет трассированный indirect light оценкой из
+`CS_CacheScreenSpaceRadiance` (64×36 ячеек → 160×90 направленных точек, складки по глубине,
+ограничение рассеяния воздуха). Работает только когда лучи выключены (`builder_runs()` = false, т.е.
+`VICTORY_BVH_BUILDER` не задан — так и есть по умолчанию). Значения: unset/`0`/`off` — выкл; число —
+доля; `constant:<level>` — константа (вариант Belobug). Побочно лечит «brown veil / milky haze» воздуха.
+
+### 19.3. Путь А против Пути Б — выбран **А**
+
+| | Путь А: ветка от `coolfox/main` | Путь Б: перенос их коммитов к нам |
+|---|---|---|
+| Что получаем | весь их протестированный host-перф (THIN, LAND, CARD_STEPS, UPLOAD_AHEAD, JOIN_COPIES, AVX2-сравнение, descriptor records, HEAP_SPREAD), ambient, Series S, NVIDIA Wave32 lowering, 8-ГБ бюджеты, residency под 32 ГБ | наши шейдерные фиксы (#2268, NVIDIA #1176/#1249A) + наш perf-батч остаются |
+| Риск/стоимость | отдельная ветка, полный перегрев кэша (~5 мин), **наши шейдерные фиксы на этой ветке отсутствуют** | **9 из 9 `git apply --check` = FAIL**: их модули `land.rs`/`safecopy.rs`/`card_steps.rs`/`thin.rs`/`queue/behind.rs`/`texture/ahead.rs` (556–912 строк каждый) у нас отсутствуют, `host.rs` разошёлся +4069/−2951, `descriptor.rs`/`shadow.rs` переписаны; это не порт, а переписывание |
+| Верифицируемость | автор собирал и гонял это дерево; `cargo check --locked` и релиз у нас прошли | каждый кусок пришлось бы чинить вручную без эталона |
+
+Наша ветка `visual-and-nvidia-fixes` при этом **не тронута** — она остаётся в `myfork` как есть.
+
+### 19.4. Что сделано и с какими числами
+
+- `git remote add coolfox https://github.com/codec-d/cool_fox.git` + `git fetch coolfox` (2,1 с).
+- Ветка **`coolfox-rtx`** от `coolfox/main` (`f4b48ad`); добавлены `AGENTS.md`, `HANDOFF.md` (наши, из
+  `visual-and-nvidia-fixes`) и `victory.toml` (`game_dir=C:\GTA6_Files`, `cache_dir=…\VIctory\cache-pareto`).
+  `victory.exe config` → exit 0, пути приняты.
+- `cargo check --workspace --locked` → **exit 0** (12 предупреждений в `victory-gpu` — их собственные).
+- `cargo build --release --locked -p victory` → **exit 0, 1 м 05 с**; `victory.exe` **9 979 904 Б**, 13:13:18.
+- Прогрев кэша под их транслятор (отдельная папка, чтобы не смешивать с нашими 25 637):
+  `all hashes asked, 25889 found: 0 in the cache already, **25 663 translated now**, 226 do not translate; 294,3 с`;
+  в `cache-pareto` 25 663 файла / 892 МБ.
+- `translate --list`: **226 непереведённых** — `195 resources: an address in an SGPR that is no root parameter`
+  (`GS_VoxelizeGeneric`; у нас это лечит #2268), `26 emit: no wave32 lowering for this wave64 program`,
+  `5 emit: a descriptor read only as data` (`CS_TraceShadowRays`). Наша ветка: 57 (40 descriptor-phi +
+  10 SGPR + 5 shadow + 2 маски) — **т.е. их транслятор лучше на descriptor-phi/SGPR (~50 программ), но не
+  содержит нашего #2268 и нашего NVIDIA wave-wide слоя**.
+
+### 19.5. Команды (PowerShell, из `C:\GTA6_Port\victory-fork`)
+
+Прогрев уже сделан; повторять только после правок `victory-shader`:
+```powershell
+$env:VICTORY_HOST_WAVE='32'; $env:VICTORY_VIEW_LIMIT='999999'; $env:VICTORY_CACHE_DIR="$env:LOCALAPPDATA\VIctory\cache-pareto"; .\target\release\victory.exe translate 'C:\GTA6_Files\shaders.rpf' --warm all --jobs 12
+```
+
+**Запуск игры (основной вариант — авторский пресет через их лаунчер):**
+```powershell
+$env:VICTORY_GAME_DIR='C:\GTA6_Files'; $env:VICTORY_DISPLAY_MODE='1920x1080'; $env:VICTORY_LOG='warn'; .\Play-VIctory.cmd pareto-residency
+```
+
+Тот же запуск без `.cmd` (если захотите менять флаги по одному):
+```powershell
+$env:VICTORY_GAME_DIR='C:\GTA6_Files'; $env:VICTORY_CACHE_DIR="$env:LOCALAPPDATA\VIctory\cache-pareto"; $env:VICTORY_AMBIENT_AIR='1.5'; $env:VICTORY_TEXTURE_NO_WAIT='1'; $env:VICTORY_RELAY='2'; $env:VICTORY_WIDE_BACK='1'; $env:VICTORY_CARD_REHASH_RUNS='1'; $env:VICTORY_JOIN_COPIES='1'; $env:VICTORY_INDIRECT_WINDOW='1'; $env:VICTORY_RELAY_COPY='1'; $env:VICTORY_CARD_STEPS='2'; $env:VICTORY_INDIRECT_BATCH='2'; $env:VICTORY_MAP_THREADS='1'; $env:VICTORY_CARD_AWAKE='1'; $env:VICTORY_SHOW_AFTER='1'; $env:VICTORY_AMBIENT='0.8'; $env:VICTORY_THIN='1'; $env:VICTORY_JOIN_PARTS='8'; $env:VICTORY_UPLOAD_AHEAD='1'; $env:VICTORY_LEVELS_ON_DEMAND='1'; $env:VICTORY_CARD_BUFFERS_MIN_KB='64'; $env:VICTORY_DISPLAY_MODE='1920x1080'; $env:VICTORY_LOG='warn'; .\target\release\victory.exe run 'C:\GTA6_Files\game_scarlett_master.exe' --console series-s --execute
+```
+
+Полезные подмены: `--console series-x` вместо `series-s` (больше title-памяти, ближе к их замерам, но
+хуже для 8 ГБ); `$env:VICTORY_AMBIENT='0'` — выключить стенд-ин света; `$env:VICTORY_AMBIENT='constant:0.6'`
+— константа Belobug; `$env:VICTORY_LOG='info'` — увидеть `host wave lanes`/`host view heaps` (нужно,
+если когда-нибудь пересобирать кэш); `-RayTracing` в `play.ps1` включает `VICTORY_BVH_BUILDER=1`
+(**не для 8 ГБ**: builder заявлен как «+40 мс/кадр», исторически писал мусор в title-память и ронял игру).
+
+### 19.6. Риски и что дальше
+
+1. **Ambient — хак, не GI**: позиции в root-таблицах зашиты (`LIGHT=(1,176)`, `DEPTH=(0,464)`,
+   `RADIANCE=(1,16)`, `AIR=(1,32)`); если наша упаковка таблиц отличается — попадёт в чужой слот
+   (симптомы: пересвет/артефакты). Откат без пересборки: `VICTORY_AMBIENT='0'`.
+2. **Series S** режет title-память до 7776 МиБ — на 8 ГБ VRAM это плюс, но игра может чаще стримить
+   (на слабом CPU это кадры). Переключение — только `--console series-x`.
+3. **Теней/RT по-прежнему нет**: 5 `CS_TraceShadowRays` не переводятся ни у них, ни у нас; builder off.
+   Т.е. «свет в помещениях» после пресета — это ambient-стенд-ин, а не настоящий GI.
+4. **Наши наработки на этой ветке отсутствуют**: нет #2268 (195 GS), нет NVIDIA #1176/#1249A (волновые
+   формы). Логичное продолжение — отдельной задачей перенести в `coolfox-rtx` наш шейдерный слой
+   (#2268 + wave-wide) **одним батчем**, затем один перегрев кэша (~5 мин). Это вернёт 195 GS в tracking
+   и, вероятно, переведёт часть 26 wave32.
+5. 226 непереведённых можно уменьшить до ~5–31, объединив обе линии; сейчас на этой ветке их 226.
+6. Все замеры авторов — AMD RDNA3 / RTX 5090 на 32 ГБ; на 3060 Ti 8 ГБ поведение не проверено ни ими,
+   ни нами. `VICTORY_RDNA_FLOAT` и их wave-формы AMD-ориентированы — не смешивать с нашим NVIDIA-слоем.
+
+### 19.7. Файлы
+
+- Отчёты субагентов: `C:\GTA6_Port\coolfox\launcher\` (`REPORT.md`, `preset-pareto-residency.md`,
+  `comparison-our-tree.md`, `security-audit.md`, `sources\Play-VIctory.cmd.txt`, `sources\play.ps1.txt`,
+  `fork-vars-unique.txt` — 345 имён `VICTORY_*`), `C:\GTA6_Port\coolfox\perf\` (`SUMMARY.md`, `patches\`
+  01-thin…09-upload-ahead, `apply-check-results.txt`, доки форка), `C:\GTA6_Port\coolfox\light\`
+  (`REPORT.md`, `TRANSLATOR-DIFF.md`, `ambient.rs`, версии `lower.rs`/`emit`/`resource.rs`/`native.rs`);
+- Сборка/прогрев этой ветки: `C:\GTA6_Port\coolfox\check-coolfox.log`, `build-coolfox.log`,
+  `warm-coolfox.log`, `translate-list-coolfox.txt`;
+- Ветка `coolfox-rtx` в `myfork`; наша `visual-and-nvidia-fixes` @ `4133084` — без изменений.
+
+## §20. Тестовый запуск coolfox-rtx на RTX 3060 Ti: замер и сравнение с нашей веткой
+
+Задание: прогнать coolfox-rtx (`7493bc8`) авторским пресетом `pareto-residency` в 1920x1080, реальными
+нажатиями (`sendkeys2.ps1`) пройти меню до 3D-мира и сцены у окна/допроса, снять FPS/VRAM/скриншоты,
+проверить ambient и пропажи эффектов, записать сравнение с `visual-and-nvidia-fixes` и запушить HANDOFF.
+Код не менялся — только флаги/CLI.
+
+### 20.1. Что запускалось (два прогона, оба 1920x1080, RTX 3060 Ti 8 ГБ, 32 ГБ ОЗУ)
+
+1. **Прогон 1 — авторский пресет** `.\Play-VIctory.cmd pareto-residency` (он жёстко шлёт
+   `--console series-s`), `VICTORY_GAME_DIR=C:\GTA6_Files`, `VICTORY_DISPLAY_MODE=1920x1080`,
+   `VICTORY_LOG=info`; 340 с; подпись окна (fps/ms/draws) каждую секунду, `nvidia-smi` каждые 2 с,
+   скриншот окна каждые 30 с; нажатия по проверенной схеме (`Enter` на 15/30 с, адаптивные `Enter`
+   каждые 10 с пока в меню, один `Down+Enter` на EULA, `Enter` в мире на 165/205/245/285/320 с).
+   Логи: `C:\GTA6_Port\run-logs-coolfox\` (out/err/captions/vram/keys, 11 скриншотов).
+2. **Прогон 2 — диагностический (те же флаги, другой только `--console series-x`)**, 320 с, то же
+   логирование, скриншоты каждые 20 с с меткой фокуса. Логи: `C:\GTA6_Port\run-logs-coolfox2\`
+   (15 скриншотов, все валидные).
+Оркестраторы: `C:\GTA6_Port\run-coolfox.ps1`, `C:\GTA6_Port\run-coolfox2.ps1`; нажатия — проверенный
+`C:\GTA6_Port\sendkeys2.ps1` (фокус через Alt-разблокировку + AttachThreadInput, затем `keybd_event`).
+
+### 20.2. FPS и VRAM (мир: от первого кадра с 500+ draw)
+
+| | coolfox-rtx, **серия S** (`.cmd`) | coolfox-rtx, **серия X** | наша `visual-and-nvidia-fixes` r6 | наша r7 |
+|---|---|---|---|---|
+| Мир начался | 139 с | **71 с** | 146 с | 141 с |
+| Выборок подписи | 163 | 243 | 194 | 199 |
+| **FPS медиана** | **3** | **2** | **6** | **6** |
+| FPS среднее | 2,88 | 1,90 | 5,27 | 4,55 |
+| FPS min / max | 0 / 4 | 0 / 3 | 0 / 9 | 0 / 8 |
+| мс/кадр медиана | 306 | 536 | 163,8 | 181,7 |
+| draw/кадр медиана | 3628 | 5031 | 3946 | 3747 |
+| **Пик VRAM (nvidia-smi)** | **7977 / 8192 МиБ (97 %)** | 7915 МиБ | 7900 МиБ | 7919 МиБ |
+| VRAM медиана | 7554 МиБ | 7777 МиБ | — | — |
+| Разложение кадра (сводка лога) | preparing 98 мс (копии 26–38 мс/95–102 МБ, текстуры 0,5–9 мс), **GPU 48–66 мс**, назад 70–81 мс/47 МБ | preparing 95 мс, **GPU 241 мс**, назад 104 мс/42 МБ | preparing 95 мс (копии 51,7 мс/99,5 МБ, текстуры 7,6 мс), **GPU 5,0 мс**, назад 76 мс/67,5 МБ | — |
+| Брошенные draw | 300–310/кадр (**300 ещё создавались**) | 313/кадр (0 создавались) | 369/кадр (0 создавались) | — |
+| Текстуры по индексу | 13 013 залито (4,3 ГБ), **25 905 ждут**, 5 595 без маппинга | 14 267 (4,0 ГБ), **28 307 ждут**, 4 270 | 44 730 (17,2 ГБ), 14 701 ждут, 13 446 | — |
+
+Вывод по скорости: **на 3060 Ti coolfox-rtx в 2–3 раза медленнее нашей ветки в той же сцене**.
+Причина видна в разложении: у нас карта простаивала (GPU 5 мс, кадр упирался в подготовку и
+копирование назад), у coolfox карта стала узким местом (GPU 48–241 мс), при этом «подготовка»
+и обратное копирование остались такими же, а очередь текстур стала хуже (28k ждут против 14,7k).
+Их механизмы (`THIN`, `CARD_STEPS=2`, `RELAY_COPY`, `UPLOAD_AHEAD`, `SHOW_AFTER`, ambient-проходы)
+на этом железе добавляют работы карте и не снимают наш главный тормоз — копирование назад.
+
+### 20.3. Главная находка: Series S = чёрный экран
+
+- Лог прогона 1: `display output: compositing two planes (overlay active) frame=1 width=1920 height=1080
+  base_format=28 overlay_format=28` — в режиме Series S включается **two-plane композит**
+  («base + overlay»). При этом 3000–3600 draw/кадр честно выполняется, подпись окна показывает
+  3 fps/306 мс, а **на экране чёрный кадр**: на скриншотах 122–248 с видны только субтитры
+  («ПРОЛОГ») и краевые элементы UI, 3D-картинки нет. Окно при этом 1354×818 (динамическое
+  разрешение под Series S), у нас — 1920×1080.
+- Прогон 2 с `--console series-x` (те же флаги, кроме модели консоли) — **картинка появилась**
+  с первого же кадра мира: окно 1920×1080, сцена у окна (тюремный двор, закат, люди), затем
+  коридор с лампами. Все 15 скриншотов валидны.
+- Вывод: на нашем дампе (`C:\GTA6_Files`) путь two-plane Series S из cool_fox не работает — их
+  коммит `1ad6e67` («Fix Series S two-plane black screen by reading RetailPlane at 72-byte stride»)
+  заточен под их раскладку; наш дамп даёт чёрный overlay. **Запускать coolfox-rtx надо с
+  `--console series-x`, а не через `Play-VIctory.cmd`** (он жёстко шлёт `series-s`).
+
+### 20.4. Графика: ambient, пересвет, пропажи
+
+- **Ambient работает**: `victory_gpu::ambient` пишет 4 строки (роли `Radiance` 1280×720/640×360,
+  `Resolve`, `Air` 160×90, level 0.8) и в прогоне 2 включает подмену сразу на входе в мир.
+  На кадре 303 с (интерьер коридора с лампами) **глухой черноты нет**: стены и спица персонажа
+  освещены, коридор читается; на кадре 263 с — профиль у окна, интерьер тёмный, но с деталями.
+  Против нашей ветки (кадр 241 с из `run-logs7`: силуэт почти в полной черноте) разница заметна.
+- **Пересвет**: жёсткого выжигания нет, но есть (а) «молочная дымка» в кадрах перехода/заката
+  (кадр 143 с) — это ровно тот `brown veil/milky haze`, который автор лечит `VICTORY_AMBIENT_AIR=1.5`;
+  (б) локальный пересвет спины персонажа в коридоре (кадр 303 с) — ambient добавляет света
+  без теней, поэтому выход за 1.0 возможен. Не критично, но яркость стоит убавить
+  (`VICTORY_AMBIENT=0.6`) при следующем прогоне.
+- **Пропажи из-за шейдеров**: за прогон дропнуто 3 compute-программы с
+  `no wave32 lowering for this wave64 program`: `02384a60fda6f2d0`, **`5dc3b25986622949`** и
+  **`6f225b641c5b0708`**. Последние два — как раз водные волюметрики, которые **наша ветка
+  переводит** благодаря NVIDIA-слою #1176/#1249A (в наших прогонах дропаются только
+  `2da4beb3`/`02384a60`). Т.е. на coolfox-rtx эффекты воды/волюметрики отсутствуют там, где
+  они есть у нас. Также в прогоне 1 был `refused dll="amd_fidelityfx_upscaler_xbox.dll"`
+  (FSR-апскейлер вне host-policy — в обоих деревьях), а в прогоне 2 — 1 событие
+  `the card has no room for more` (VRAM 97 %).
+- **Текстуры/геометрия**: в проверенных кадрах пропавших текстур и дыр в геометрии не видно —
+  персонажи, двор, коридор с лампами на месте. Но очередь текстур хуже нашей (25,9–28,3 тыс. ждут
+  против 14,7 тыс.), и `behind`-механики не успевают: часть текстур показывает неполный mip.
+  Теней/RT по-прежнему нет (builder off, 5 `CS_TraceShadowRays` не переводятся ни у них, ни у нас).
+
+### 20.5. Итог и рекомендация
+
+| Критерий | coolfox-rtx | visual-and-nvidia-fixes |
+|---|---|---|
+| Картинка в мире | **только `--console series-x`**; `.cmd`-пресет = чёрный экран | рисует сразу (series-x по умолчанию) |
+| FPS в той же сцене | медиана **2–3** | медиана **6** |
+| GPU-время | 48–241 мс (карта — узкое место) | 5 мс (карта простаивает, кадр упирается в копирование) |
+| Свет в интерьере | **ambient-стенд-ин включён**: не чёрно | интерьер тёмный (ambient нет) |
+| Шейдеры | 226 не переводятся; **2 водные дропаются** | 57 не переводятся; водные переведены |
+| Кэш шейдеров | отдельная папка `cache-pareto`, 25 663 | 25 637, ключ свой |
+
+**Рекомендация:** основной линией остаётся `visual-and-nvidia-fixes` (быстрее в ~2–3 раза и без
+чёрного экрана); coolfox-rtx держать как экспериментальную ветку для света и запускать только
+`--console series-x`. Правильный следующий шаг — **перенести `victory-gpu/src/ambient.rs` из
+coolfox-rtx в нашу ветку** (это `gpu`-файл, кэш шейдеров не сбрасывает; ~530 строк + 3 флага
+`VICTORY_AMBIENT`/`_AIR`/`_SHADE`), а не наоборот: переносить весь cool_fox в нашу линию нечем
+(9/9 `apply-check` = FAIL), а наша линия уже быстрее и с рабочим Series X.
+
+### 20.6. Штатное закрытие не сработало
+
+`CloseMainWindow()` вернул `True` в обоих прогонах, но процесс **не завершился**: ждали 60 с
+(прогон 1) и 45 с (прогон 2), после чего пришлось убивать. Кэш шейдеров от этого не пострадал
+(25 663 файла на месте), но новые пайплайны сессии в `cache-pareto` почти не попали: в прогоне 1
+кэш вырос с 25 663 до **25 695 (+32 файла)** — вероятно, это записи образов/частичные, а не
+полный pipeline book. Т.е. «новые пайплайны записались» выполнилось лишь частично — нужен
+штатный выход через меню игры, а не WM_CLOSE (у тайтла свой обработчик закрытия).
+
+### 20.7. Файлы
+
+- Логи прогона 1 (Series S): `C:\GTA6_Port\run-logs-coolfox\` — `captions.log`,
+  `vram.log`, `keys.log`, `watch.log`, `out.log`, `err.log` (15 828 строк), `shot-*.png` (11),
+  `cache-before.txt`/`cache-after.txt`;
+- Логи прогона 2 (Series X): `C:\GTA6_Port\run-logs-coolfox2\` — то же + 15 валидных
+  `shot-*_f0.png`; лучшие кадры: `shot-203_f0.png` (окно/двор), `shot-263_f0.png` (профиль у окна),
+  `shot-303_f0.png` (коридор с лампами, ambient);
+- Оркестраторы: `C:\GTA6_Port\run-coolfox.ps1` (авторский `.cmd`), `C:\GTA6_Port\run-coolfox2.ps1`
+  (Series X; известный дефект: параметр функции `$pid` конфликтует с read-only `$PID`, поэтому
+  метка фокуса всегда `_f0`, но нажатия работают через `sendkeys2.ps1`);
+- Для сравнения: `C:\GTA6_Port\run-logs6\` (наша ветка, prefetch=0) и `C:\GTA6_Port\run-logs7\`
+  (prefetch=1).

@@ -2384,6 +2384,14 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
+            // A texture the card had no memory for: the slot is not noted as
+            // made from this record, so the next ask makes it again (it kept
+            // its null view for good) - port of Belobug #287.
+            if built.is_none()
+                && matches!(view, View::Shader(resource, _) if crate::resource::retrying(resource as crate::object::This))
+            {
+                made[index as usize] = 0;
+            }
             if built.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }

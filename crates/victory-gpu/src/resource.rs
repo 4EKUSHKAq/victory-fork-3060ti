@@ -1166,8 +1166,9 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// The host refused to make it: not tried again before this
+    /// `crate::host::now_ms` (`u64::MAX`: for good; 0: not refused).
+    refused_until: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1304,6 +1305,20 @@ fn lazy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_TEXTURES").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// Whether a host texture of this thread's was refused for want of the
+    /// card's memory ([`host_texture_as`]), since it was last taken.
+    static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread was refused memory ([`host_texture_as`]) since the
+/// last call.
+#[cfg(windows)]
+fn take_out_of_memory() -> bool {
+    OUT_OF_MEMORY.replace(false)
+}
+
 /// Whether a texture described by `desc` takes its contents from title
 /// memory: one the host neither renders to nor writes (no target, depth or
 /// unordered access flag). Its host copy can be made again from that
@@ -1330,8 +1345,31 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !refused(r)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
+/// How long a texture the card had no memory for waits before it is asked
+/// for again (as long as uploads wait).
+#[cfg(windows)]
+const RETRY_MS: u64 = 500;
+
+/// Whether the host refused `r`'s copy and is not asked again yet.
+#[cfg(windows)]
+fn refused(r: &Resource) -> bool {
+    crate::host::now_ms() < r.host.refused_until.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether title texture `this` has no host copy because the card had no
+/// memory for it, and will be asked again ([`RETRY_MS`]): a slot that shows
+/// it is not done with.
+#[cfg(windows)]
+pub(crate) fn retrying(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let until = resource(this).host.refused_until.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && until != u64::MAX
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1345,9 +1383,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        if !make || refused(r) {
             return None;
         }
+        // A refusal of the card's memory is not final ([`retrying`]): an
+        // earlier one of this thread's is not what this one is about.
+        let _ = take_out_of_memory();
         let clear = r
             .host
             .clear
@@ -1400,9 +1441,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc, r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // Out of memory: asked again once the card may have room; any
+            // other refusal is for good.
+            let until = if take_out_of_memory() {
+                crate::host::now_ms().saturating_add(RETRY_MS)
+            } else {
+                u64::MAX
+            };
+            r.host.refused_until.store(until, Relaxed);
             return None;
         };
+        r.host.refused_until.store(0, Relaxed);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2220,6 +2269,11 @@ fn host_texture_as(
         }
     };
     if let Err(e) = made {
+        // Out of memory: the host copy is asked for again later
+        // ([`hosted`]); any other refusal is for good.
+        if e.code().0 == E_OUTOFMEMORY {
+            OUT_OF_MEMORY.set(true);
+        }
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if let Some(t) = &texture {
@@ -2368,7 +2422,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            refused_until: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
         },

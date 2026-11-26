@@ -1924,3 +1924,78 @@ M3 (async on): 4,6 fps / 219 мс медиана; M2 (off): 4,0/252; M2b (off, �
 - Порт: `audit\settle-room.diff` (минимальный патч), `audit\c-06702fe8.diff` (полный коммит), `audit\c-ceb9e1f7.json` (следующий кандидат);
 - Тесты: `audit\test-settle-room-attempt1.log` (флейк), `attempt2.log` (зелёный), `test-settle-room.log`;
 - Харнесс: `C:\GTA6_Port\run-road.ps1` (`-Console`, `-SettleRoom`), снапшот `audit\harness-run-road-2026-11-26b.ps1`.
+
+## §24. Раунд 4: ветка `feat-parallel-refresh` — порт `VICTORY_PARALLEL_REFRESH` из `ceb9e1f7`, честный парный A/B (прироста нет), аудиты чёрных силуэтов и оконных ручек VRAM (2026-11-26 вечер)
+
+Ветка **`feat-parallel-refresh`** от `feat-settle-room` @ `f8970e3` (в ней уже `feat-heap-worker` @ `f7dcf01`, порт `SETTLE_ROOM` `1710537` и §23). Коммит кода **`4c0a1e6`**, этот §24 — следующий коммит. Задание требовало сначала 3 параллельных read-only субагента (код не менять): сделано — S1 (порт `PARALLEL_REFRESH`), S2 (чёрные силуэты в коридоре/ambient), S3 (`WINDOW_UPLOAD`/`CARD_WINDOWS_MB`/VRAM); отчёты `audit\*.md`, ниже их итоги.
+
+### 24.1. Что перенесено (`VICTORY_PARALLEL_REFRESH`, `ceb9e1f7`)
+
+Источник: fxceless/victory-fork **`ceb9e1f7`** (+270/−6, 6 файлов; родитель — `06702fe8`, т.е. между нашей базой `9c184b35` и им 73 коммита; сам флаг от промежуточных коммитов **не зависит**, конфликт был только контекстный). Перенесён **только `crates/victory-gpu/src/host.rs`: +105/−1**. Осознанно отброшено: `descriptor.rs`/`descriptor/host.rs` (диагностика `MIRROR_*` — при нужде отдельным шагом), `victory-hle/src/modules/dstorage.rs` (диагностика slowest request — не про флаг), `draw.rs` (переименование `VICTORY_SPREAD`→`VICTORY_DISPATCH_SPREAD` — spread из `06702fe8` у нас не портирован), README.
+
+Механика: проверки текстур (`Staging::refresh`: write-watch/guards → чтение/хеш → детайлинг) больше не идут инлайн в `Step::Texture`, а собираются в `Batch.due_textures` и выполняются батчем в `check_textures()` — перед любым нашим write в title memory (`title_written`/`title_wrote`) и в `flush()` (до отправки списков) — через существующий пул `crate::shadow::wide_run` (submitting-поток тоже работает, возврат после всех). Сумма потоков вычитается из `PREPARING[2]`, «textures N ms» в строке кадра становится wall-временем; счётчики `PARALLEL_CHECKS` (каждые 16 384 батча — строка в лог). Включение: `VICTORY_PARALLEL_REFRESH=1`; `alt` — 20 с вкл/20 с выкл с маркером в логе (для парного замера в одном прогоне). Новых потоков/каналов/локов нет, VRAM-аллокаций нет, `victory-shader` не тронут; кэш шейдеров — 76 973 файла (не изменён), `prebuilt-pipelines.txt` 888 094 Б не тронут, библиотека пайплайнов 1 092 204 120 Б (прогоны только дописывали в неё пайплайны, как и раньше).
+
+Проверки: `cargo check --workspace` = 0 (одно старое предупреждение `placed_filler_twins`); `cargo test --workspace` — попытка 1 упала на известном флейке `inplace::tests::warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` (196 passed / 1 failed в `victory-gpu --lib`, см. §23.3), попытка 2 — **612 passed, 0 failed** (все наборы и doc-tests); `cargo build --release -p victory --locked` — 33,9 с, `victory.exe` 9 025 024 Б. Прогоны pr1/pr2 сняты этим же exe (version.txt: HEAD `f8970e3`, содержимое дерева = будущий `4c0a1e6`); vis1/vis2 — уже с `4c0a1e6`.
+
+### 24.2. A/B `VICTORY_PARALLEL_REFRESH=alt` — 2 прогона, прироста нет
+
+Прогоны: `road\pr1` (worldAt 253, 30/30 кадров, afk 6), `road\pr2` (worldAt 71, 31/31, afk 10); 480 с, компактное окно 1280×720 topmost, анти-AFK W/40 с, `BAKE_TEXTURES_MS=20`, `HEAP_WORKER=1`, `FPS_COUNTER=all`, ambient 0.6/1.5, `-ParallelRefresh alt`; по 24 переключения на прогон.
+
+| Показатель (медианы, кадры мира draws ≥ 500) | ON | off | разница |
+|---|---|---|---|
+| n строк кадров | 59 | 54 | — |
+| draws медиана | 4 348 | 4 360 | равные условия |
+| ms/frame | **181,9** | **171,7** | **+10,2 мс (хуже)** |
+| fps | 5,5 | 5,9 | −0,4 |
+| preparing | 131,6 | 124,5 | +7,1 |
+| copies | 87,7 | 77,2 | +10,5 |
+| textures | 8,3 | 9,2 | −0,9 |
+| GPU wait | 31,8 | 30,6 | +1,2 |
+| copy-back | 97,6 | 93,7 | +3,9 |
+
+По прогонам: pr1 ON 267,4 против off 272,5 мс (−5,1 — шум: сцена поздняя, 20/18 кадров); pr2 ON 155,3 против off 151,0 (+4,3). **Парные соседние 20-секундные окна** (n=16, дрейф сцены сокращается): медиана разницы кадра **+15 мс** (ON медленнее), textures −0,9 мс, preparing +2,7, copies +1,4, copy-back −1,6.
+
+**Механика работает, но кадра не даёт:** счётчик pr2 — 16 384 батча, 251 028 текстур, сумма потоков 23 954 мс против 10 368 мс стены = **2,31× бок о бок** (у автора 3,6–3,8× на его сцене). Строка «texture refreshes per frame, all threads»: ON 16,5 мс (из них asking write-watch 9,3) против off 8,6 (asking 1,8) — при параллельном батче резко растёт время опроса журнала/guard'ов, и оно съедает выигрыш. Гипотеза: helper-потоки `wide` делятся с `VICTORY_HEAP_WORKER` (один пул), плюс наши textures уже 8–13 мс (не 11–12, как у автора), а heap-воркер часть работы уже снял. VRAM: пики 7 495 / 7 761 МиБ, потерь устройства 0, «no room for more» по 1 строке на прогон (базовая 1).
+
+**Вердикт (AGENTS п.7): прироста нет, парный замер даёт +10…+15 мс к кадру → флаг оставлен выключенным по умолчанию** и в дефолтную команду не включён (`-ParallelRefresh alt` — только для замеров). «Откат» = не задавать переменную: поведение тогда побайтово как до порта.
+
+### 24.3. Визуальная проверка ambient и оконных ручек (2 прогона; коридор не открылся — честно)
+
+Задание просило короткий прогон 180 с с рекомендованными S2/S3 `VICTORY_AMBIENT*` и `VICTORY_WINDOW_UPLOAD=1` при `TEXTURE_MAX_DIM=768` и проверку скриншотов коридора. Сделано иначе, по данным аудитов:
+- **180 с до коридора не доходят:** в `m7b` коридор был на t≈409–469, мир стартует на 65–253 с (S2); уже 480-секундные прогоны показали, что сцена может и не открыться;
+- **`TEXTURE_MAX_DIM=768` не освобождает VRAM:** очередь текстур добивает до 94 %-линии (11 492 ждущих), а кэп режет mip0 у 1024-текстур — то есть добавляет «мыло» вместо запаса (S3); оставлен 1024;
+- **`VICTORY_WINDOW_UPLOAD=1` без `VICTORY_CARD_WINDOWS_MB>0` — no-op** (S3): взят минимальный диагностический `CARD_WINDOWS_MB=64` (≤ +64 МиБ к пику, 80 %-линия).
+
+Прогоны: `road\vis1` (480 с, `-Ambient 1.2 -AmbientAir 1.5 -AmbientShade 0.5,0.6`) и `road\vis2` (540 с, `-Ambient constant:0.6 -AmbientAir 1.5 -AmbientShade 0`); оба — `-WindowUpload 1 -CardWindowsMb 64 -TextureMaxDim 1024`, остальное дефолт; кадры 31/31 и 35/35, afk 8/10. VRAM-пики 7 460 и 7 539 МиБ, потерь устройства 0, «no room for more» по 1 строке (база).
+
+**Оконные ручки включились:** `GPU upload heaps ... supported=true`, самопроверка «such heaps are used»; окна реально в upload heap — «so far 16 on the card (64 MB), 0 turned down for the card's room, … for the most asked» (кэп 16 окон). Выигрыша по кадру не ждали и не получили: мир vis1 6,4 fps / 155,7 мс (draws 4 562), vis2 6,6 / 152,6 (4 676) против m7b 5,8 / 174,9 (5 503) — сцены разные, при равных draws разница в шуме; меню vis2 p99 122,3 мс, stalls 2 (как база), vis1 p99 262 (разовый длинный кадр). Для 180 с окна дали бы ещё меньше — вывод S3 подтверждён.
+
+**Коридор:** ни vis1, ни vis2 в него не попали (оба прогона — яркий двор/вид из окна; средняя яркость клиента 48–51 и 56–66 против 19–40 у m7b в тёмном коридоре 334–469). Поэтому «исчезли ли чёрные силуэты» на новых ambient-значениях проверить не удалось; по аудиту S2 ambient их и не уберёт: в `m0b` при **ambient OFF** спина охранника у A102 ~29 sRGB — ровно как в `m7b` при `VICTORY_AMBIENT=0.6`; причина — отсутствие RT-GI/ламп в помещении (диффузный свет тайтла = 0 вне прямого света), кламп «спиной к свету» 0,2×all и тёмная ткань/низкое альбедо. Ambient-ручки это не лечат; `545ebe96` (VItoriaBr «follow the sky dome») — плоская заливка, эквивалент `constant:`, NO-GO; настоящее лечение — штатный RT-GI/builder (5 `CS_TraceShadowRays` + 64 trace-программ), отдельная большая задача.
+
+Что подтверждено визуально: рекомендованные значения **не выжигают кадр** — закатные сцены с солнцем остались контрастными, без «brown veil» и пересвета; интерьер в висте виден (стены/предметы с деталями), кадры чистые, «запечённой пустоты» нет; `VICTORY_AMBIENT_AIR=1.5` — только туман, на черноту не влияет; `VICTORY_AMBIENT_SHADE` по умолчанию (`1.0,0.6`) душит углы (тестировали `0.5,0.6` и `0`).
+
+### 24.4. Аудиты трёх субагентов (read-only, до правок)
+
+- **S1 — `audit\parallel-refresh-audit.md` + `audit\parallel-refresh.diff`:** механика `ceb9e1f7`, база/зависимости (parent `06702fe8`, 73 коммита, зависимостей нет), конфликты (одна хунка `near_writes`/`texture_spans`/`title_wrote_near` из `06702fe8` у нас отсутствует — опущена), адаптированный патч применим (`git apply --check` = 0), новых тестов/флейков/VRAM нет; **GO** на отдельный шаг.
+- **S2 — `audit\ambient-corridor-audit.md`:** почему чёрное (не ambient: сравнение m0b/m7b, RT-GI, кламп, альбедо), семантика `VICTORY_AMBIENT`/`_AIR`/`_SHADE`/`constant:...`, рекомендованные наборы (0.8/1.5; 1.2/1.5+`0.5,0.6`; `constant:0.6`), код-фикс `545ebe96` — **NO-GO** в этом раунде; реальное устранение — RT-GI.
+- **S3 — `audit\window-upload-audit.md`:** `WINDOW_UPLOAD` — модификатор `CARD_WINDOWS_MB` (окно 4 МиБ, 80 %-линия DXGI-бюджета, кэп); VRAM: запас на полном прогоне 223–398 МиБ, 64 МБ — безопасная диагностика, ≥128 — NO-GO, `768` — NO-GO как «запас»; реальные рычаги VRAM: `VICTORY_TEXTURE_ROOM_PERCENT` 94→88/90 (−0,4…−0,6 ГБ) и `VICTORY_CARD_BUFFERS_MB` 1024→512 (−~430 МБ).
+
+### 24.5. Форки/апстрим (проверено в этом раунде)
+
+`fxceless/victory-fork`: после нашего sync добавлены `a20809de` (диагностика) и `58de9bf4` (16-битные значения через типизированные views + SDWA sign extension, визуальный фикс; **требует удалить оба кэша шейдеров** — для нас стоп-фактор, возвращаться только с политикой сброса кэша). Исправлений по `PARALLEL_REFRESH`/ambient/окнам после `ceb9e1f7` нет. `uiliannn/VItoriaBr` `545ebe96` — плоский ambient от купола неба, эквивалент `constant:`, NO-GO. `ubiquitarianism/leonida` `dbe7cf36` (window write-back) и `xcl-dev/xcl` (compute pipelines) — идеи на потом, код другой.
+
+### 24.6. Что дальше (по убыванию пользы)
+
+1. **VRAM-запас** — отдельный парный A/B `VICTORY_TEXTURE_ROOM_PERCENT=88/90` (или `CARD_BUFFERS_MB=512`): убрать «no room for more» и пустые/чёрные текстуры, дать место окнам; сейчас пик 7,8–8,0 из 8,19 ГиБ.
+2. **Чёрные силуэты в коридорах** — только RT-GI/лампы (большая задача) либо постоянная заливка `VICTORY_AMBIENT='constant:...'` как визуальный костыль (плоская картинка, не по умолчанию).
+3. **Copy-back/copies** — главная стена (S2/S3 подтверждают: пик подготовки и копий 60–78 / 82–128 мс); окна в upload-heap выигрыша не дают; нужен структурный срез объёма copy-back (как §23.4).
+4. **PARALLEL_REFRESH** — вернуться, только если появится отдельный пул потоков (не делить с heap-воркером) или тест с `-HeapWorker 0`; сейчас конкуренция за `wide`-потоки и рост asking write-watch.
+5. **`58de9bf4`** — когда будет решение по сбросу кэша шейдеров (сейчас 76 973 файла кэша и 1 042 МиБ пайплайнов трогать нельзя).
+
+### 24.7. Файлы
+
+- Прогоны: `C:\GTA6_Port\road\{pr1,pr2,vis1,vis2}\` (captions/vram/watch/keys/version, env.txt, flags.txt, shot-*.png; коридорного кадра в vis1/vis2 нет — см. 24.3);
+- Анализаторы: `C:\GTA6_Port\analyze-parallel-refresh.ps1` (снапшот `audit\harness-analyze-parallel-refresh.ps1`), `C:\GTA6_Port\audit\analyze-pr-ab.ps1` (парный разбор pr1+pr2), прежний `analyze-ab.ps1` для сводок;
+- Харнесс: `C:\GTA6_Port\run-road.ps1` (+`-ParallelRefresh`, `-WindowUpload`, `-CardWindowsMb`; снапшот `audit\harness-run-road-2026-11-26c.ps1`), `sendkeys2.ps1` без изменений;
+- Аудиты: `audit\{parallel-refresh-audit.md,ambient-corridor-audit.md,window-upload-audit.md}`, патч `audit\parallel-refresh.diff`, полный дифф коммита `audit\lead-ceb9e1f7.diff`;
+- Тесты/сборка: `audit\{test-parallel-refresh.log,test-parallel-refresh-attempt2.log}` (флейк/зелёный).

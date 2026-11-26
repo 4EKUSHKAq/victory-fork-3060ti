@@ -966,6 +966,11 @@ git push -u myfork perf-and-upstream-fixes master
   (`d31f841`). `git remote -v`: только `myfork` (исходных remote у локального репозитория нет).
 - `HANDOFF.md` и `AGENTS.md` были untracked — закоммичены в `perf-and-upstream-fixes` вместе с этим
   отчётом, чтобы §16 и правила лежали в бэкапе. Код в этом шаге не менялся.
+- Замечание: сразу после создания GitHub отдавал репозиторий как **private**, но при проверке через
+  10–15 минут API показал `visibility: public` (причина не установлена; возможно, гонка при создании).
+  Исправлено: `gh repo edit 4EKUSHKAq/victory-fork-3060ti --visibility private --accept-visibility-change-consequences`;
+  повторная проверка — `{"isPrivate":true,"visibility":"PRIVATE"}`. Секретов/игровых файлов в репозитории
+  нет (только код VIctory GPL-3.0 + `AGENTS.md`/`HANDOFF.md` с локальными путями).
 
 ### 16.2. Наш срез и что в нём есть
 

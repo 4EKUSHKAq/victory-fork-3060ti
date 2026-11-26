@@ -520,11 +520,11 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
-    /// viewports, the scissors, the blend factor and the stencil reference.
+    /// whether a topology was set, snapshots of render target and depth
+    /// views, the viewports, scissors, blend factor and stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<Option<crate::descriptor::RtvSnapshot>>,
+    depth_view: Option<crate::descriptor::RtvSnapshot>,
     targets_set: bool,
     /// Last resolved RTV/DSV records bound on this host list, for `VICTORY_BIND_CACHE=1`.
     bound_rtvs: Vec<(usize, u32, [u32; 6])>,
@@ -933,48 +933,53 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        if bind_cache() && self.targets_set {
-            let mut next_rtvs: Vec<(usize, u32, [u32; 6])> = Vec::with_capacity(handles.len());
-            for &h in handles {
-                if let Some(rec) = crate::descriptor::rtv_record(h) {
-                    next_rtvs.push(rec.key());
-                }
+        self.target_views.clear();
+        self.target_views.extend(handles.iter().map(|&h| {
+            let record = crate::descriptor::rtv_record(h);
+            if record.is_none() {
+                once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target without a recorded view"
+                );
             }
-            let next_dsv = crate::descriptor::dsv_record(depth).map(|rec| rec.key());
+            record.map(|r| r.snapshot())
+        }));
+        self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
+        if crate::host::host().is_none() {
+            return;
+        }
+        if bind_cache() && self.targets_set {
+            let next_rtvs: Vec<(usize, u32, [u32; 6])> = self
+                .target_views
+                .iter()
+                .flatten()
+                .map(|v| v.restore().key())
+                .collect();
+            let next_dsv = self.depth_view.map(|v| v.restore().key());
             if next_rtvs == self.bound_rtvs && next_dsv == self.bound_dsv {
-                self.target_handles.clear();
-                self.target_handles.extend_from_slice(handles);
-                self.depth_handle = depth;
                 return;
             }
             self.bound_rtvs = next_rtvs;
             self.bound_dsv = next_dsv;
         } else if bind_cache() {
             self.bound_rtvs.clear();
-            for &h in handles {
-                if let Some(rec) = crate::descriptor::rtv_record(h) {
-                    self.bound_rtvs.push(rec.key());
-                }
-            }
-            self.bound_dsv = crate::descriptor::dsv_record(depth).map(|rec| rec.key());
+            self.bound_rtvs.extend(self.target_views.iter().flatten().map(|v| v.restore().key()));
+            self.bound_dsv = self.depth_view.map(|v| v.restore().key());
         }
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
         self.targets_set = true;
+        self.record_targets(list);
+    }
+
+    /// Recreate host views from the values captured at SetRenderTargets,
+    /// not from descriptor slots that the caller may since have rewritten.
+    fn record_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
-                continue;
-            };
+        for snapshot in self.target_views.iter().flatten() {
+            let record = snapshot.restore();
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -997,7 +1002,8 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_view.and_then(|snapshot| {
+            let record = snapshot.restore();
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
@@ -1103,9 +1109,7 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Render target views retain the descriptor values originally recorded.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1117,9 +1121,10 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
-            self.targets_set = false;
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.bound_rtvs.clear();
+            self.bound_rtvs.extend(self.target_views.iter().flatten().map(|v| v.restore().key()));
+            self.bound_dsv = self.depth_view.map(|v| v.restore().key());
+            self.record_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);

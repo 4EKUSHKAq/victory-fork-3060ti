@@ -1603,6 +1603,43 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
     find_pieces(scans)
 }
 
+/// Faults the pages of `[address, address + len)` in before they are read:
+/// upstream's measurement had 49 745 faults a frame be 145 ms of a 263 ms
+/// frame, and the kernel faults a range in one call far cheaper than one
+/// page at a time. A hint only: a failed call changes nothing.
+///
+/// Off by default: on our default path (relay, `find_pieces`) three
+/// measured runs showed no gain and possibly a loss (HANDOFF §15), so it
+/// is opt-in. `VICTORY_PREFETCH=1` turns it on, `=0` (or unset) off.
+#[cfg(windows)]
+fn prefetch(address: usize, len: usize) {
+    #[repr(C)]
+    struct Entry {
+        address: *mut core::ffi::c_void,
+        bytes: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PrefetchVirtualMemory(
+            process: *mut core::ffi::c_void,
+            count: usize,
+            entries: *const Entry,
+            flags: u32,
+        ) -> i32;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("VICTORY_PREFETCH").map(|v| v == "1").unwrap_or(false));
+    if !on || len == 0 {
+        return;
+    }
+    let entry = Entry {
+        address: address as *mut core::ffi::c_void,
+        bytes: len,
+    };
+    // SAFETY: a live mapping of ours; the call only faults pages in.
+    unsafe { PrefetchVirtualMemory(std::ptr::null_mut(), 1, &entry, 0) };
+}
+
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
 /// are, the title address the copy starts at, offsets from and to): the
 /// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
@@ -1610,6 +1647,17 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
 /// work of about [`WIDE_JOB`] bytes that hold whole pieces.
 fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+    // The pieces are compared below page by page; fault them in before the
+    // compare, a whole range a call ([`prefetch`]): the copy's bytes and
+    // the snapshot's beside them are what was reported to cost 145 ms of a
+    // 263 ms frame. Zeroed scans (no snapshot) are skipped.
+    #[cfg(windows)]
+    for &(data, before, _start, from, to) in &scans {
+        if data != 0 && before != 0 && from < to {
+            prefetch(data + from, to - from);
+            prefetch(before + from, to - from);
+        }
+    }
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
@@ -2923,6 +2971,16 @@ impl Shadow {
             // memory speed), title memory read only where the GPU wrote.
             #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
+            // The title's pages of the range, in one call a range instead of
+            // a fault a page ([`prefetch`]): the title's own measurement of
+            // this fork had 49 745 faults a frame be 145 ms of a 263 ms
+            // frame. Only when the pieces were not found before: the wide and
+            // relay paths find them through [`find_all`], which faults its
+            // ranges in itself.
+            #[cfg(windows)]
+            if found.is_none() {
+                prefetch(start + from, to - from);
+            }
             let differing = match found {
                 Some(found) => found,
                 None => self.differing(from, to, before),

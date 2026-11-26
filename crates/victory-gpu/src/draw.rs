@@ -2754,7 +2754,12 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                // Every use of the table, constant buffers too: the cache
+                // key covers the descriptors' words, not what the memory
+                // behind them holds, so a CBV whose buffer was copied since
+                // the table was first made is brought up to date here (the
+                // buffer's shadow copy is what the slot shows).
+                for u in entries.iter() {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
@@ -3498,7 +3503,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
     }
     match (view, kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        // A null shader view names no memory: nothing to bring up to date.
+        (View::Shader(resource, _), ResourceType::Srv) if *resource != 0 => {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).

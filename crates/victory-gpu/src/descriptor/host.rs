@@ -816,21 +816,8 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
-        };
-        let views = if fits(UNCAPPED_VIEWS) {
+        let Some(_host) = host() else { return };
+        let views = if takes_views(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
@@ -841,6 +828,30 @@ pub(crate) fn probe_view_limit() {
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
+}
+
+/// Whether this host makes a shader-visible view heap of `count` slots: asked
+/// by making one and letting it go at once, as the title's own heap is made
+/// later. `false` when no host is up yet (call it after the device is).
+///
+/// The Direct3D 12 limit for a shader-visible CBV/SRV/UAV heap is 1,000,000
+/// descriptors
+/// ([`D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2`](https://learn.microsoft.com/windows/win32/direct3d12/constants));
+/// some drivers (AMD RDNA3) take more, NVIDIA takes exactly that. The title
+/// asks for 1,245,184 (`gpu_scarlett`'s own heap), which no D3D12 host can
+/// hold in one heap.
+pub(crate) fn takes_views(count: u32) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: plain heap creation; the heap is released at once.
+    let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    made.is_ok()
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
@@ -903,7 +914,11 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                tracing::warn!(
+                    count,
+                    fitted = null - extra,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
                 null - extra
             };
             match make(size) {
@@ -3640,5 +3655,33 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod heap_size_tests {
+    use super::{takes_views, HostHeap, PORTABLE_VIEWS, UNCAPPED_VIEWS};
+
+    /// What this host's shader-visible view heaps take, against what the
+    /// title asks for (`1_245_184`) and what the fork would like to give it
+    /// ([`UNCAPPED_VIEWS`]). Run by name:
+    /// `cargo test --release -p victory-gpu -- --ignored view_heap_size --nocapture`.
+    #[test]
+    #[ignore = "on the card: run it by name with --ignored --nocapture"]
+    fn view_heap_size_this_host_takes() {
+        // The device is made by the first heap, so ask for a small one first.
+        if HostHeap::new(false, 8).is_none() {
+            println!("no host GPU: nothing measured");
+            return;
+        }
+        for count in [
+            PORTABLE_VIEWS,
+            1_048_576,
+            1_245_184,
+            1_500_000,
+            UNCAPPED_VIEWS,
+        ] {
+            println!("{count} views: {}", takes_views(count));
+        }
     }
 }

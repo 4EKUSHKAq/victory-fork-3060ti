@@ -2244,11 +2244,14 @@ impl Resource {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
             // SAFETY: placement checked the range lies inside the heap.
             Backing::Placed { heap, offset } => unsafe {
-                (*heap.cast::<Heap>())
-                    .memory
-                    .ptr
-                    .as_ptr()
-                    .add(offset as usize)
+                // A placement whose heap is gone (a resource freed before one
+                // it was placed in, as the null-view cases of the title show)
+                // has no memory to name: a null address reads nothing.
+                let h = heap.cast::<Heap>();
+                if h.is_null() {
+                    return std::ptr::null_mut();
+                }
+                (*h).memory.ptr.as_ptr().add(offset as usize)
             },
             Backing::Address(at) => at,
         }

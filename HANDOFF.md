@@ -1999,3 +1999,65 @@ M3 (async on): 4,6 fps / 219 мс медиана; M2 (off): 4,0/252; M2b (off, �
 - Харнесс: `C:\GTA6_Port\run-road.ps1` (+`-ParallelRefresh`, `-WindowUpload`, `-CardWindowsMb`; снапшот `audit\harness-run-road-2026-11-26c.ps1`), `sendkeys2.ps1` без изменений;
 - Аудиты: `audit\{parallel-refresh-audit.md,ambient-corridor-audit.md,window-upload-audit.md}`, патч `audit\parallel-refresh.diff`, полный дифф коммита `audit\lead-ceb9e1f7.diff`;
 - Тесты/сборка: `audit\{test-parallel-refresh.log,test-parallel-refresh-attempt2.log}` (флейк/зелёный).
+
+## §25. Раунд 5: ветка `feat-back-quiet-and-visual` — `VICTORY_BACK_QUIET` (#1188) с alt и `VICTORY_BAKE_SOURCES` (#1264); `TEXTURE_BUDGET_MB=4096` на 8 ГБ — NO-GO (оверкоммит/пейджинг), цена FPS-бокса ~21 мс, «оранжевая роба»/пустые лица (2026-11-26 поздний вечер)
+
+Ветка **`feat-back-quiet-and-visual`** от `feat-parallel-refresh` @ `9c25632`. Коммиты кода **`49b6d37`** (BACK_QUIET) и **`e909f66`** (BAKE_SOURCES), этот §25 — следующий. Задание: 3 параллельных read-only субагента (аудит и подготовка патчей, код не меняя) → порт #1188 с `=alt` → порт #1264 → обязательные проверки/сборка → 2 прогона 480 с по заданию (с `TEXTURE_BUDGET_MB=4096`) → VRAM/скриншоты → фиксация лучших настроек в `run-road.ps1`. По ходу выяснилось, что 4096 МБ на 8 ГБ уводит прогон в пейджинг, поэтому добавлены контрольные прогоны **bq3/bq4** с бюджетом по умолчанию (иначе A/B мерил бы память, а не флаг); сделано 4 прогона вместо 2 — причина в 25.4.
+
+### 25.1. Что перенесено
+
+**#1188 `VICTORY_BACK_QUIET`** (fxceless/victory-fork, head `0460bf53`, +84/−4, `crates/victory-gpu/src/shadow.rs`). Наш собственный copy-back в private write-watched память титула ставит write-watch биты, и на следующем asking журнал видит его как запись игры: копия перечитывает и шлёт на карту свой же вывод (census форка #1169: ~92 % касаний copied-back страниц). Патч: `GetWriteWatch(0)` до записи (если бит уже стоит — старый путь), `write_mapped`, `ResetWriteWatch`, `watch::wrote_own`/`watch::writing` (журнал знает — другие копии перечитают), своя копия отмечается current, как `put_back_own` для view-памяти. Адаптация **+109/−4**: сырой PR-diff не ложится (hunks 2/5 — наши `#[cfg(diagnostics)] backreads::stored` между `put_back_own` и `return n`), добавлен режим `alt` в `quiet_back()` (20 с вкл/20 с выкл, маркер `copy-backs into private, write-watched title memory are written quietly from now (VICTORY_BACK_QUIET=alt): ON/off`), счётчик — строка в лог каждые 16 384 тихих стретча. Off by default (`VICTORY_BACK_QUIET` unset); `victory-shader` не тронут.
+
+**#1264 `VICTORY_BAKE_SOURCES`** (head `4c14ca41`, +488/−32; наша адаптация **+510/−34**: `descriptor/host.rs` +67, `draw.rs` +477/−34). Bake-decoration не биндит текстуры через таблицу: индексы view-heap лежат в его константах и записях по 304 Б, и что не на карте в момент bake — запекается пустым на весь прогон (чёрные/битые лица, «пустая» кожа). Патч распознаёт bake-программу по форме дескрипторов (SRV-буфер stride 304 + CBV в одном table slot; все 322 программы), читает константы и до 256 записей, собирает индексы, `unmade` возвращает в очередь и перед draw поднимает эти слоты первыми, вне очереди/бюджета/`room()`, до `VICTORY_BAKE_SOURCES_MB` (1024). Адаптировано под наш heap worker: forced-проход никогда не отдаётся worker'у (`if !bake && !force && kick { return }`), затем `urgent()` сериализует его с worker'ом; thread-local `PASS_SOURCES/PASS_SOURCED/BAKE_TABLES`. Отличие от PR: у автора флаг фактически включён по умолчанию (`is_none_or(|v| v != "0")`), у нас off by default: `=1` Force, `=0` Count, unset — прежнее поведение без чтения констант.
+
+Проверки: #1188 — `cargo check --workspace`=0, `cargo test --workspace` **612 passed/0 failed** с первой попытки (флейки warp-тестов не выпали), release 30,0 с, exe 9 038 336 Б. #1264 — check=0, тест попытка 1: 196 passed/2 failed (ровно известные флейки §23.3 `inplace::tests::warp_…` и `indirect::tests::warp_…`), попытка 2 — **614 passed/0 failed** (+2 новых теста из патчей), release 31,1 с, финальный `victory.exe` **9 058 816 Б**. Кэш шейдеров (76 973 файла), `prebuilt-pipelines.txt` и библиотека пайплайнов не тронуты (только штатные дозаписи прогонов).
+
+### 25.2. Аудиты трёх субагентов (read-only)
+
+- **`back-quiet`** (`audit\back-quiet-port.md`, `back-quiet-adapted.diff`): механика, наши API (`write_mapped`, `watch::writing/wrote_own`, `descriptor::host::remapped`, `Shadow.copied`), `windows-sys 0.61.2` уже с feature `Win32_System_Memory` — Cargo.toml не менялся; точка вставки `quiet_back` перенесена после `tails()` (в PR она разрезала doc). Риск: окно между write и `ResetWriteWatch` теряет title-write для watch (форк мерил касания 0,00–0,05 МБ/с); в начале ON-фазы fallback завышает «old way» (ON занижается консервативно). Замеры автора: RTX 4090 192–203→188–192 мс quiet-only, с BACK_OWN_VIEW 164–168 мс; Linux/Proton preparing 122,1→51,2 мс.
+- **`bake-sources`** (`audit\bake-sources-port.md`, `bake-sources-adapted.diff`): `host.rs`-хунки легли дословно (+ тест), `draw.rs` адаптирован вручную из-за HEAP_WORKER/`early_textures`; компиляцию субагент не гонял — стек прошёл check с первого раза. Риски: forced-загрузки обходят `room()` (в PR-комментарии RTX 5080: 1 из 5 прогонов почернела рубашка), до 78 КБ чтений на draw; при артефактах `VICTORY_BAKE_SOURCES_MB=0`/256. У автора `sampled_wrong` 30–511→0.
+- **`cpu-pack`** (`audit\cpu-pack-1317-report.md` + `step-index-adapted.diff`, `fills-plain-adapted.diff`, `light-refresh-adapted.diff`): на следующий шаг. `STEP_INDEX` (`84c5dc00`) — чисто, без зависимостей, GO первым; `FILLS_PLAIN` (`de4146a0`) — чисто, но #1223: тёмный смаз на левой стене 3/4 запусков на 5080 (off by default, проверять скриншотом); `LIGHT_REFRESH` (`94ed363c`) — крупнейший (22,8–44,5 мс submitting-потока в run 275), но в одиночку не переносится: нужны предусловия `44bff61b`/`6d20eed` (ABSENT_ONCE/ABSENT_MS=told и др., ~260 строк), адаптированный кумулятивный патч собран; мерить только с `ABSENT_ONCE=1 ABSENT_MS=told` в обоих состояниях пары. Issue #1317: семь свитчей вместе 144,1→114,5 мс (−20 %), preparing 84,0→68,7 (RTX 5080, Series S).
+
+### 25.3. A/B `VICTORY_BACK_QUIET=alt` (2 пары прогонов по 480 с, 1280×720 topmost, anti-AFK W/40 с, HEAP_WORKER=1, BAKE_SOURCES=1, BAKE_TEXTURES_MS=100, ambient 0.5 + shade 0.3,0.4)
+
+| прогон | бюджет текстур | fpsbox | ON n | ON ms/fps | off n | off ms/fps | copies ON→off (мс/МБ) | preparing ON→off | copy-back ON→off | paired Δ кадра |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bq1 | 4096 | all | 30 | 343,7 / 3,0 | 35 | 333,8 / 3,0 | 76,2/95,5 → 75,6/119,1 | 127,4→117,3 | 111,2→97,2 | −16,5 |
+| bq2 | 4096 | 0 | 35 | 299,9 / 3,3 | 35 | 300,4 / 3,3 | 60,4/88,5 → 71,8/120,0 | 98,3→125,2 | 89,6→88,0 | +1,5 |
+| bq3 | default | all | 35 | **193,7 / 5,2** | 38 | **208,6 / 4,9** | 96,9/87,4 → 104,1/118,8 | 141,5→157,6 | 125,4→110,2 | **−7,1** |
+| bq4 | default | 0 | 35 | **167,9 / 6,0** | 40 | **174,4 / 5,7** | 62,3/90,4 → 71,9/129,4 | 108,5→128,3 | 92,6→90,1 | **−6,5** |
+
+Механизм работает честно: **copies −26…−30 % байт**, copies −7…−10 мс, preparing −16…−20 мс, paired-медиана кадра в чистых прогонах **−6,5…−7,1 мс (−3,7…−7,2 %)**; в паре с 4096 кадр не двигается, потому что он GPU-bound пейджингом (25.4), хотя CPU-часть и там снимается (preparing −27 мс, copies −11 мс). Тихий путь берёт **40–44 %** стретчей (bq4: 688 128 стретчей / 29 308 МБ против 1 016 688 старым путём; bq3: 589 824/24 762 против 820 841) — как у автора (~45 %). Время copy-back в шуме или чуть выше (+2…+15 мс) — цена двух kernel-вызовов на стретч, но суммарный preparing и кадр лучше. 0 exceptions/device loss во всех 4 прогонах. **Флаг включён по умолчанию в `run-road.ps1`** (`-BackQuiet 1`), в коде остаётся off.
+
+### 25.4. `VICTORY_TEXTURE_BUDGET_MB=4096` на 8 ГБ — NO-GO (оверкоммит и пейджинг)
+
+bq1/bq2 (по заданию) против bq3/bq4 (бюджет по умолчанию, всё остальное то же): **333,9 vs 201,0 мс** (box all) и **300,4 vs 171,4 мс** (box 0) — **+102…+133 мс кадра**; GPU wait 182,1/165,2 vs 35,5/36,9 мс. Причина в логе bq1: система меняла бюджет карты 7256→6619 МБ; «at the last look 4408 МБ карты + 3752 МБ shared», дальше 9092 МБ карты + 5976 МБ shared (bq2: 8572+5364) — оверкоммит 13,9–15 ГБ; nvidia-smi пик 7985/7975 МиБ (65/106 сэмплов ≥7900), util 100 % при 82–103 Вт и 46–55 °C — карта ждёт память, а не рендерит. В контрольных bq3/bq4 (и в pr2 прошлого раунда) на загрузке 4680+4152 МБ, пик **7486/7749 МиБ**, в мире GPU wait 35–37 мс. Потери устройства нет ни в одном прогоне, но кадр хуже на 50–66 %, поэтому 4096 не включаем; старый 2500 тоже не возвращаем (он резал текстуры) — лучший вариант **оставить бюджет по умолчанию** (`room()`: floor 2 ГиБ + 94 % бюджета карты). Запас VRAM, если понадобится — рычаги S3 §24.4 (`VICTORY_TEXTURE_ROOM_PERCENT` 88/90, `CARD_BUFFERS_MB=512`), не бюджет текстур.
+
+### 25.5. Стоимость углового FPS-бокса ≈ 21 мс
+
+Чистая пара bq3 (`FPS_COUNTER=all`) vs bq4 (`0`) при прочих равных: world-медианы 201,0 vs 171,4 мс (+29,6), в корзине 4500–5500 draws — **192,4 vs 171,4 мс = +21,0 мс** (55 vs 26 кадров) — ровно цифра #1083 (~21 мс, 159 vs 138). В паре с 4096 та же корзина дала +42,4 мс (пейджинг раздувает разницу), поэтому оценка — по чистой паре. Вывод: для игры и честных замеров FPS-бокс выключать (`VICTORY_FPS_COUNTER=0`: окно-подпись всё равно показывает fps/ms/draws, строки кадра в err.log остаются); в харнессе дефолт оставлен `all` для мониторинга скриншотов, `0` — для «лучшего» кадра.
+
+### 25.6. Визуал: «оранжевая роба», пустые лица, пересвет
+
+- Скриншоты bq1 (4096) и bq3 (default): тюремный двор, Lucia в красной робе, NPC в оранжевых робах — ткань/полосы/лица/волосы текстурированы, стены/плакаты с деталями; пересвета/белой пелены нет, `VICTORY_AMBIENT=0.5` + `SHADE=0.3,0.4` дают мягкий свет (прежний 1.0,0.6 душил углы). Пустых/чёрных текстур не видно; «оранжевой робы» как плоской заливки в этих прогонах нет.
+- Лог bake: во всех 4 прогонах `sampled_wrong_so_far=0` (без фичи автор видел 30–511), `megabytes_so_far` 94–152 МБ на прогон; строки только на загрузке (draws=1…128), в мире не сыпятся.
+- Оговорка из PR: принудительные загрузки обходят `room()`, у RTX 5080 в 1 из 5 прогонов почернела рубашка (в наших 4 прогонах не воспроизвели; при артефакте — `VICTORY_BAKE_SOURCES_MB=0`/256). «Целые головы» (глаза/зубы без головы) PR не лечит — отдельный баг.
+
+### 25.7. Лучшие настройки → `run-road.ps1`
+
+Дефолты харнесса обновлены (снапшот `audit\harness-run-road-2026-11-26e.ps1`): `-Ambient 0.5`, `-AmbientShade '0.3,0.4'`, `-BakeMs 100`, `-BakeSources 1`, `-BackQuiet 1`, `-HeapWorker 1`, `-FpsCounter all`, `-TextureMaxDim 1024`, бюджет текстур **не задаётся** (4096 — NO-GO, 2500 — не возвращать). Контрольные плечи: `-HeapWorker 0`, `-BackQuiet '' -BakeSources '' -BakeMs 20`. Для игры/честного FPS: `-FpsCounter 0` (+21 мс).
+
+### 25.8. Что дальше
+
+1. CPU-пак #1317: `STEP_INDEX` → `FILLS_PLAIN` (проверять левую стену скриншотом, #1223) → `LIGHT_REFRESH` отдельным шагом с предусловиями (§25.2), парные `alt`-замеры по одному изменению.
+2. Не включать `TEXTURE_BUDGET_MB=4096`; запас VRAM — `TEXTURE_ROOM_PERCENT`/`CARD_BUFFERS_MB`.
+3. FPS-бокс выключать в игре; для мониторинга мерить при `FPS_COUNTER=all` и вычитать ~21 мс.
+4. Из рекона дальше: `#1295 MERGE_MASK`, `#1293 sync_heaps`, `#1316`, VItoriaBr dynamic slots; следить за #987/#1296/upstream #3276/#3275/#3274.
+
+### 25.9. Файлы
+
+- Прогоны: `C:\GTA6_Port\road\{bq1,bq2,bq3,bq4}\` (captions/vram/watch/keys/version, env.txt, flags.txt, shot-*.png);
+- Анализаторы: `C:\GTA6_Port\analyze-back-quiet.ps1` (парный alt: маркеры, счётчик BACK_QUIET, скользящие окна) и `C:\GTA6_Port\analyze-bq-runs.ps1` (env, медианы кадра, пик VRAM, ошибки, bake-лог, цена FPS-бокса); снапшоты `audit\harness-analyze-{back-quiet,bq-runs}.ps1`;
+- Харнесс: `C:\GTA6_Port\run-road.ps1` (+`-BackQuiet`, `-BakeSources`, `-TextureBudgetMb`; снапшот `audit\harness-run-road-2026-11-26e.ps1`), `sendkeys2.ps1` без изменений;
+- Аудиты/патчи: `audit\{back-quiet-port.md,bake-sources-port.md,cpu-pack-1317-report.md}`, `audit\{back-quiet-adapted.diff,bake-sources-adapted.diff}`, `audit\{step-index-adapted.diff,fills-plain-adapted.diff,light-refresh-adapted.diff}`; сырьё `audit\pr1188.*`, `audit\pr1264.*`, `audit\c-{94ed363c,de4146a0,84c5dc00}.*`;
+- Тесты/сборка: `audit\{test-back-quiet.log,test-bake-sources.log,test-bake-sources-attempt2.log}`.

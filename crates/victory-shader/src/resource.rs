@@ -575,11 +575,24 @@ impl<'a> Tracer<'a> {
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
-        self.layout.iter().enumerate().find_map(|(i, p)| {
-            let first = self.stage.user_sgpr(p.user_data);
-            let dword = u32::from(code).checked_sub(first.into())?;
-            (dword < p.sgprs).then_some((i, dword))
-        })
+        // A geometry shader runs standalone (user data from s0) or merged with
+        // its neighbours (8 system SGPRs first), and nothing in its metadata
+        // says which: try both placements.
+        let shifts: &[i32] = match self.stage {
+            HwStage::Gs => &[0, 8],
+            _ => &[0],
+        };
+        for &shift in shifts {
+            let found = self.layout.iter().enumerate().find_map(|(i, p)| {
+                let first = i32::from(self.stage.user_sgpr(p.user_data)) + shift;
+                let dword = i32::from(code) - first;
+                (dword >= 0 && (dword as u32) < p.sgprs).then_some((i, dword as u32))
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     /// The SOP2 operands of `v` if an instruction with one of `names` wrote it.
@@ -981,7 +994,12 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
+        // A table's base is a 32-bit address (its high half is zero), and an
+        // offset added to it stays inside the same 4 GiB, so the high half of
+        // such an address is not checked. Only a descriptor's own 64-bit
+        // address has a high half to match.
+        if high.is_some()
+            && !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             return Err("an address with an untracked high half");

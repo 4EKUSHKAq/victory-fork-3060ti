@@ -1,12 +1,13 @@
 # HANDOFF — текущее состояние работ
 
-Обновлено: 2026-11-26, 12:05 (Asia/Yekaterinburg)
-Ветка: `perf-and-upstream-fixes` (от `check-env-and-build`; `master` не правился)
-Ветка запушена в приватный бэкап `myfork` = https://github.com/4EKUSHKAq/victory-fork-3060ti
-(коммиты: `8f12565` + коммит с этим отчётом; `master` = `d31f841`).
-Ночная сессия: §12–§15 (прогоны, prefetch, чёрный кадр). Дневная сессия: §16 — бэкап-репозиторий и
-разведка трёх апстримов по HDR/пересвету, теням/непрямому свету и FPS, аудит наших 254 непереведённых
-шейдеров и флагов. Код не менялся, остановка перед правками — по заданию.
+Обновлено: 2026-11-26, 12:15 (Asia/Yekaterinburg)
+Ветка: `visual-and-nvidia-fixes` (от `perf-and-upstream-fixes`; `master` не правился)
+Запушена в приватный бэкап `myfork` = https://github.com/4EKUSHKAq/victory-fork-3060ti
+(вместе с `perf-and-upstream-fixes` и `master`).
+§17: три субагента-разведчика, затем последовательный перенос: #2268 (user-data/вокселизация) и
+NVIDIA-слой (#1176 + control-flow часть #1249); bloom-фикс f342dcfcfb по итогам разведки **не переносился**
+(для нашей линии он no-op). Полный `cargo test` зелёный, релиз пересобран, кэш прогрет заново,
+непереведённых по `--list` стало 57 вместо 254.
 
 ## Что сделано на этом шаге
 
@@ -31,6 +32,7 @@
 | 14 | Разбор чёрного кадра в интро по коду и логам | готово: это не VRAM и не баг очистки — штатный чёрный кадр перехода/титров, растянутый в секунды штормом создания PSO (530–549 пайплайнов, кадр 3–7,6 с, ~1050 draw в `dropped`); с тёплой библиотекой в прогоне 4 не воспроизвёлся — §14 |
 | 15 | A/B prefetch-фикса (3 прогона по 350 с), решение opt-in, итог ночи | готово: при равном контенте B(выкл) 5,9 fps против A2(вкл) 5,6; разброс между одинаковыми сборками того же порядка → выигрыш не подтверждён; фикс оставлен opt-in (`VICTORY_PREFETCH=1`, по умолчанию выкл.), релиз пересобран, check exit 0, полный test зелёный (3-я попытка; 1–2 — пре-существующие флаки warp-тестов) — §15 |
 | 16 | Бэкап-репозиторий `4EKUSHKAq/victory-fork-3060ti` (private) + разведка fxceless/victory-fork, Marvisak/VIctory, xcl-dev/xcl и аудит наших 254 непереведённых шейдеров/HDR-флагов | готово: репозиторий создан, `myfork` добавлен, `perf-and-upstream-fixes` и `master` запушены; найдены конкретные кандидаты (bloom/movreld-фикс, #2268, NVIDIA wave64 #1249, BVH-путь, perf-серии), всё с пометкой влияния на кэш шейдеров; код не менялся — §16 |
+| 17 | Ветка `visual-and-nvidia-fixes`: 3 субагента-разведчика, затем порт #2268 (user-data/вокселизация) и NVIDIA-слоя (#1176 + control-flow #1249); bloom f342dcfcfb не переносился (no-op) | готово: `check` после каждого шага exit 0, полный `test` зелёный, релиз 43,03 с, кэш прогрет 249,4 с (25 637 переводов), `--list`: **254→57** (исправлено 197, новых 0), DXIL compute +2 — §17 |
 
 ## Окружение (проверено 2026-11-26)
 
@@ -1133,3 +1135,107 @@ and indirect light, the local-light shadow mask»).
   `translate-list.txt`, `translate-failures.txt`, `nonvoxel-failures.txt`;
 - скрипты разведки: `C:\GTA6_Port\recon\recon-fx.ps1`, `recon2.ps1`, `recon-prs.ps1`;
 - код не менялся; `git status` — только `AGENTS.md`/`HANDOFF.md` (теперь закоммичены).
+
+## §17. Ветка `visual-and-nvidia-fixes`: перенос #2268 и NVIDIA-слоя (2026-11-26)
+
+Задание: починить пересвет (кандидат 1 = bloom `f342dcfcfb`), вокселизацию/свет в помещениях
+(кандидат 2 = #2268) и совместимость с NVIDIA (кандидат 3 = #1249/#1176/#1248). Сначала три параллельных
+субагента-разведчика (каждый сохранял диффы в `C:\GTA6_Port\upstream\`), затем главный агент вносил правки
+последовательно с `cargo check --workspace` после каждого шага. Ветка создана от `perf-and-upstream-fixes`.
+
+### 17.1. Итоги разведки субагентов (главное)
+
+| Кандидат | Что нашли | Решение |
+|---|---|---|
+| **Bloom, Marvisak `f342dcfcfb`** | Коммит — ручной порт открытого PR #457; чинит отказ `barycentrics read directly` у `PS_DownSampleBloomFilter(Karis)`. **Но наша линия другая**: наш `lower.rs` = fxeless-линия с `lazy_barycentric` (barycentric-входы грузятся как `SV_Barycentrics`), такого отказа у нас нет; bloom-шейдер **уже переводится**; в списке 254 его нет. Порт был бы мёртвым кодом + 7 минут перегрева кэша. | **Не переносил** (фальсифицирован). Патч-кандидат сохранён: `upstream\marvisak-bloom-port-adapted.diff` (+9 КБ, применим, поведение не меняет) — если захотите эмпирически проверить. Пересвет — из §16.7 (а)/(в): нет теней/GI и/или OS Auto HDR. |
+| **#2268, Marvisak** | PR №2268 **не существует**; это issue с патчем в ветке форка `bittertea0323/VIctory:try/upstream-base`, коммиты `a35b26d` и `5eaf119` (итого +26/−8 в `native.rs`/`resource.rs`). Upstream его **отверг** (#2546 закрыт: «weakens a soundness check»; #2284 — только тесты). Патч адаптирован к нашему дереву (`upstream\marvisak-2268-adapted-to-victory-fork.diff`, `git apply --check` OK). | **Перенесён** (2 файла, +26/−8). |
+| **NVIDIA, fxceless #1249/#1176/#1248** | #1176 — 1 файл `emit/mod.rs` (+23 строки): wave-wide форма как last resort; APPLIES целиком. #1249 — 19 файлов, из них три слоя: (A) Wave64 control-flow для 32-lane хоста (loop_regions + lower.rs + 1 строка mod.rs), (B) lossless d16, (C) R11-эксперимент «superseded». #1248 — альтернатива #1176 (селективный список + отдельный ключ кэша), логически конфликтует с #1176. | **Перенесены #1176 + слой A из #1249**; слой B (d16) и #1248/C — отложены (см. 17.5). |
+
+### 17.2. Что изменено в коде (5 файлов, +77/−23 + новый файл)
+
+- `crates/victory-shader/src/native.rs` (+2/−2): `Gs` — user data с s0 (standalone), а не с s8.
+- `crates/victory-shader/src/resource.rs` (+24/−6): `param_of` пробует сдвиги `[0,8]` для GS; high half
+  проверяется только у root-дескриптора (`high.is_some()`), у таблиц — нет.
+- `crates/victory-shader/src/emit/mod.rs` (+25/−1): блок «wave-wide branches (last resort)» (#1176) после
+  всех форм; `branches_around` получает третий аргумент (`native.wave64 && host_max_wave()==32`).
+- `crates/victory-shader/src/emit/lower.rs` (+37/−4): `all_lane_blocks/lane_regions/branches_around` c
+  `loop_exits`; учёт natural loops при выходе из цикла; 4 call-site (LDS-проверки — с `true`; barrier/wave-sum —
+  только для `Cs && wave64 && host_max_wave()==32`).
+- `crates/victory-shader/src/emit/loop_regions.rs` — **новый** (51 строка): `natural_loops` CFG.
+- `crates/victory-shader/src/emit/wave64_tests.rs` (+2/−2): два assert под новую сигнатуру.
+
+Каждый шаг: `cargo check --workspace` → **exit 0** (сначала после #2268, затем после NVIDIA-слоя).
+
+### 17.3. Проверки, сборка, прогрев
+
+- `cargo test --workspace` — **зелёный с первого прогона, exit 0**: core 11, formats 25 (+4 ignored),
+  gpu 184 (+6), hle 100, loader 27+2+1, pe 7, pipeline 4, shader 216 (+3), xtask 4, doc 0. Флаки warp-тестов
+  в этот раз не проявились.
+- `cargo build --release -p victory` — **exit 0, 43,03 с**; `target\release\victory.exe` 8 501 248 Б, 12:00:52.
+- Новый ключ кэша (хэш исходников `victory-shader` изменился) → полный прогрев той самой командой:
+  `$env:VICTORY_HOST_WAVE='32'; $env:VICTORY_VIEW_LIMIT='999999';
+  .\target\release\victory.exe translate 'C:\GTA6_Files\shaders.rpf' --warm all --jobs 12`
+  → **249,4 с**, `all hashes asked, 25889 found: 25637 translated now, 0 in the cache already,
+  252 do not translate`.
+
+### 17.4. Сколько из 254 перевелось (главный результат)
+
+Сравнение `translate --list` до/после (полные списки: `C:\GTA6_Port\upstream\translate-failures-BEFORE.txt`
+и `C:\GTA6_Port\recon\translate-list-AFTER.txt`):
+
+| | Было (§16) | Стало |
+|---|---|---|
+| Непереведённых программ (`--list`) | **254** | **57** |
+| Из них исправлено | — | **197** (195 `GS_VoxelizeGeneric_*` + 2 `water_shading:CS_TransmissionVolumetrics*`) |
+| Новых падений | — | **0** |
+| DXIL compute emitted | 2674 / 2682 | **2676 / 2682** (+2) |
+| Группа `resources: an address in an SGPR…` | 195 | **0** |
+| Осталось: `descriptor chosen by control flow` (cascade shadows, reflection PS, puddles) | 40 | 40 |
+| Осталось: `hardware SGPR input` (`PS_PedTexturedCutOutTint_Zero`) | 10 | 10 |
+| Осталось: `descriptor read only as data` (**5 × `CS_TraceShadowRays`**) | 5 | 5 |
+| Осталось: `opaque lane mask` / `lane mask exchanged` | 1 / 1 | 1 / 1 |
+
+**Почему `--warm all` показывает 252, а не 57** (честное объяснение): счётчик прогрева идёт через
+`victory_gpu::shader_cache::warm` → `victory_shader::emit::translate`, который **не эмитит GS-стадию**
+(merged geometry stages; в отчёте `--list` есть только VS/PS/CS/MS). 195 GS-программ после #2268 успешно
+проходят resource-tracking (поэтому исчезли из `--list`), но DXIL для GS-стадии у нас всё равно не
+генерируется — и прогреватель считает их «do not translate» (195 + 57 = 252). Реальных новых переводов
+в DXIL ровно **+2** (две водные compute-программы, слой A #1249). Практический вывод: #2268 улучшает
+метрику трассировки ресурсов и предпосылку для будущей GS-эмиссии, но **картинку сейчас не меняет**.
+
+### 17.5. Что НЕ взято и почему (риски)
+
+1. **Bloom `f342dcfcfb` — не переносился**: для нашей линии no-op (см. 17.1). Пересвет лечится не им.
+2. **#1249 слой B (lossless d16)** — не входит в 6 отказов compute; трогает GPU-крейт в местах, где наша
+   линия уже разошлась (`descriptor/host.rs` и `draw.rs` — конфликт), требует своего цикла проверки.
+   Отложено отдельной задачей.
+3. **#1248** — альтернатива #1176; его селективный список конфликтует с уже применённым last-resort
+   (он всё равно ловит исключённые хеши). Оставлено на случай, если #1176 даст артефакты.
+4. **#1176 — blanket last-resort**: автор #1248 предупреждал, что wave-wide для `369cbe906ea72764`
+   (`GpuParticleUpdate:CS_Visibility`) и `5dc3b259`/`6f225b64` (water volumetrics) давал падение карты /
+   чёрные пятна на воде. Теперь эти формы будут пробоваться в последнюю очередь. **Откат без пересборки:
+   `VICTORY_WAVE_WIDE=0`.** Это главный риск шага — проверять игровым прогоном.
+5. **Оставшиеся 2 compute-отказа** (`2da4beb3`, `02384a60`) этими PR не лечатся — нужен #1124
+   (per-instruction EXEC guards), вне текущего задания.
+6. **#2268 отвергнут upstream'ом** по семантике (standalone-GS раскладки); у нас он adopted как
+   tracking-only. Возможен откат `git revert` этого файла, если понадобится.
+
+### 17.6. Следующий шаг (по заданию — стоп перед perf-батчем)
+
+1. Игровой прогон на новой сборке: проверить пересвет (стало ли лучше/иначе), воду/партиклы (риск #1176)
+   и 6 отказов compute в логе (ожидание: `2cc4c19` и, возможно, `369cbe9`/водные — с пайплайном;
+   `2da4beb`/`02384a6` — останутся).
+2. Если артефакты — `VICTORY_WAVE_WIDE=0` как откат без пересборки.
+3. Затем perf-батч (кандидат 5 из §16.8): #1227, #1237, #1224, #1178, #1240, #1233/#1232 + #3011.
+4. Для теней/непрямого света остаются кандидаты 4 (BVH-путь) и 5×`CS_TraceShadowRays` (порт нужен
+   из будущего апстрима — в текущем срезе они не переводятся).
+
+### 17.7. Файлы и состояние
+
+- Ветка `visual-and-nvidia-fixes` (от `perf-and-upstream-fixes`), коммит с этим отчётом запушен в `myfork`.
+- Диффы и разборы: `C:\GTA6_Port\upstream\marvisak-2268-*.diff`, `marvisak-2268-analysis.md`,
+  `marvisak-bloom-port-adapted.diff`, `fxceless-pr1249.diff`, `fxceless-pr1176.diff`,
+  `fxceless-pr1248.diff`, `pr1249-parts\*`, `fxceless-pr*-apply-check.txt`;
+  результаты `--list`: `C:\GTA6_Port\recon\translate-list-AFTER.txt`, лог прогрева
+  `C:\GTA6_Port\recon\warm-after-visual.log`;
+- `git status` после коммита чист; `master` не тронут.

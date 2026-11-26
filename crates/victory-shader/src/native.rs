@@ -142,8 +142,8 @@ impl HwStage {
     /// shaders, which run as one) have 8 system SGPRs first.
     pub fn user_sgpr(self, index: u8) -> u8 {
         match self {
-            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index + 8,
-            HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
+            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Ms => index + 8,
+            HwStage::Gs | HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
         }
     }
 }

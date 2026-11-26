@@ -656,6 +656,10 @@ data under the cache folder.
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
+With a pad connected the keyboard is not a pad; `VICTORY_KEY_PAD=1` adds the
+keyboard's stand-in buttons to pad 0 as well (for automated runs, whose key
+presses would otherwise be heard by nothing):
+
 | Keys | Pad |
 |------|-----|
 | W A S D / I J K L | left / right stick |

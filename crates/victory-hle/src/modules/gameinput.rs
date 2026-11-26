@@ -1127,6 +1127,43 @@ mod host {
         }
     }
 
+    /// `VICTORY_KEY_PAD=1`: the keyboard's stand-in buttons are added to a
+    /// real pad in slot 0 as well. The stand-in pad exists only while no pad
+    /// is connected (see [`fallback`]), so with a pad plugged in the keyboard
+    /// is otherwise heard by nothing; this lets an automated run drive the
+    /// pad-driven menus with its key presses.
+    fn key_pad() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_KEY_PAD").is_some_and(|v| v == "1");
+            if on {
+                tracing::info!("VICTORY_KEY_PAD=1: the keyboard is added to pad 0 as well");
+            }
+            on
+        })
+    }
+
+    /// Adds the keys held to a pad: buttons are or-ed in, the triggers and
+    /// sticks move only where the pad itself does not.
+    pub(super) fn add_keys(pad: &mut PadState, keys: &[KeyState]) {
+        let stand_in = fallback(keys);
+        pad.buttons |= stand_in.buttons;
+        pad.left_trigger = pad.left_trigger.max(stand_in.left_trigger);
+        pad.right_trigger = pad.right_trigger.max(stand_in.right_trigger);
+        if stand_in.left_x != 0.0 {
+            pad.left_x = stand_in.left_x;
+        }
+        if stand_in.left_y != 0.0 {
+            pad.left_y = stand_in.left_y;
+        }
+        if stand_in.right_x != 0.0 {
+            pad.right_x = stand_in.right_x;
+        }
+        if stand_in.right_y != 0.0 {
+            pad.right_y = stand_in.right_y;
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
@@ -1157,6 +1194,12 @@ mod host {
                         pad.buttons |= button;
                     }
                 }
+            }
+            // `VICTORY_KEY_PAD=1`: the keyboard drives a real pad too (the
+            // stand-in pad exists only while no pad is connected).
+            if slot == 0 && key_pad() {
+                let keys = self.keys();
+                add_keys(&mut pad, &keys);
             }
             Some(pad)
         }
@@ -1267,6 +1310,21 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    #[test]
+    fn keyboard_buttons_add_to_a_connected_pad() {
+        let mut pad = PadState {
+            buttons: X,
+            ..Default::default()
+        };
+        let keys = [KeyState {
+            virtual_key: 0x0D,
+            ..Default::default()
+        }];
+        add_keys(&mut pad, &keys);
+        assert!(pad.buttons & A != 0, "Enter is the pad's A");
+        assert!(pad.buttons & X != 0, "what the pad itself held stays");
     }
 }
 

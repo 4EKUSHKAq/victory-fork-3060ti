@@ -84,6 +84,20 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
 - Not run in this tree: the unit tests after the merge (the same changes passed them in the
   working tree they came from: 182 of the graphics crate's, the new shader test both ways).
 
+- **`VICTORY_FILL_HOT=1`** (ported from fork PR #1224, Steenax6/VIctory-NVID `2e21055`; off by default):
+  when a flight changes bytes a fill of upload memory had read ahead, only reads of that 64 KiB of
+  title memory wait for flights from then on, where the first such fill made every fill wait for
+  the rest of the run. Measured in that tree: one fill of 2,048 bytes did that, and two fills a
+  frame then waited 54 ms for flights whose bytes were the same afterwards 1,229 times of 1,229.
+- **`VICTORY_SHADOW_CACHE=1`** (fork PR #1224; off by default): the table of title buffers is read
+  shared by the ask whose buffer has its host copy already, and each recording thread remembers the
+  copies it was answered with until a buffer is added, taken out or loses its copy. Not taken here
+  yet: the lookup cache of upstream main (`VICTORY_LOOKUP_CACHE`) does the same work, is measured,
+  and the two cannot both stand (both rewrite `shadow::lookup`).
+- **`VICTORY_BURY_ASIDE=1`** (fork PR #1224; off by default): the host objects that waited for a
+  landed flight are released on a thread of their own, not in the landing. Measured in that tree:
+  about 3 ms a frame off the thread that lands flights.
+
 ### Earlier (2026-11-25, evening UTC)
 
 **Update, 2026-11-25 evening: a frame capture built into the layer, and a

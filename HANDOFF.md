@@ -1,13 +1,15 @@
 # HANDOFF — текущее состояние работ
 
-Обновлено: 2026-11-26, 12:15 (Asia/Yekaterinburg)
+Обновлено: 2026-11-26, 12:55 (Asia/Yekaterinburg)
 Ветка: `visual-and-nvidia-fixes` (от `perf-and-upstream-fixes`; `master` не правился)
 Запушена в приватный бэкап `myfork` = https://github.com/4EKUSHKAq/victory-fork-3060ti
 (вместе с `perf-and-upstream-fixes` и `master`).
-§17: три субагента-разведчика, затем последовательный перенос: #2268 (user-data/вокселизация) и
-NVIDIA-слой (#1176 + control-flow часть #1249); bloom-фикс f342dcfcfb по итогам разведки **не переносился**
-(для нашей линии он no-op). Полный `cargo test` зелёный, релиз пересобран, кэш прогрет заново,
-непереведённых по `--list` стало 57 вместо 254.
+§18: мониторинг всех 6 звёзд GitHub (за 48 ч — 2085 коммитов и 5849 PR), затем perf-батч **без сброса
+кэша шейдеров**: #1237+#1245 (`VICTORY_LOOKUP_CACHE`), #1227 (`VICTORY_CARD_SYNC_BATCH`), host-часть
+#1224 (`VICTORY_FILL_HOT`/`VICTORY_BURY_ASIDE`), VRAM-пара #1240+#1258 (`VICTORY_TEXTURE_MAX_DIM`,
+`VICTORY_DYNAMIC_SLOTS`, `VICTORY_BIND_CACHE`, `VICTORY_RAM_TRIM_MB`) и свежий #1269 (94 % под текстуры
+на картах ≤8 ГиБ). #1178 отклонён (6939 строк, 14 чужих коммитов, конфликт с нашим prefetch). Кэш
+проверен: 25 637 шейдеров на месте, 0 переведено заново, перепрогрев 4,7 с.
 
 ## Что сделано на этом шаге
 
@@ -33,6 +35,7 @@ NVIDIA-слой (#1176 + control-flow часть #1249); bloom-фикс f342dcfc
 | 15 | A/B prefetch-фикса (3 прогона по 350 с), решение opt-in, итог ночи | готово: при равном контенте B(выкл) 5,9 fps против A2(вкл) 5,6; разброс между одинаковыми сборками того же порядка → выигрыш не подтверждён; фикс оставлен opt-in (`VICTORY_PREFETCH=1`, по умолчанию выкл.), релиз пересобран, check exit 0, полный test зелёный (3-я попытка; 1–2 — пре-существующие флаки warp-тестов) — §15 |
 | 16 | Бэкап-репозиторий `4EKUSHKAq/victory-fork-3060ti` (private) + разведка fxceless/victory-fork, Marvisak/VIctory, xcl-dev/xcl и аудит наших 254 непереведённых шейдеров/HDR-флагов | готово: репозиторий создан, `myfork` добавлен, `perf-and-upstream-fixes` и `master` запушены; найдены конкретные кандидаты (bloom/movreld-фикс, #2268, NVIDIA wave64 #1249, BVH-путь, perf-серии), всё с пометкой влияния на кэш шейдеров; код не менялся — §16 |
 | 17 | Ветка `visual-and-nvidia-fixes`: 3 субагента-разведчика, затем порт #2268 (user-data/вокселизация) и NVIDIA-слоя (#1176 + control-flow #1249); bloom f342dcfcfb не переносился (no-op) | готово: `check` после каждого шага exit 0, полный `test` зелёный, релиз 43,03 с, кэш прогрет 249,4 с (25 637 переводов), `--list`: **254→57** (исправлено 197, новых 0), DXIL compute +2 — §17 |
+| 18 | Мониторинг 6 звёздных репозиториев + perf-батч без сброса кэша: #1237+#1245, #1227, host-часть #1224, VRAM-пара #1240+#1258, свежий #1269; #1178 отклонён | готово: `check` после каждого из 6 шагов exit 0, полный `test` зелёный (gpu 188 вместо 184), релиз 30,88 с, кэш шейдеров **не сброшен** (`0 translated now, 25637 in the cache already`, 4,7 с) — §18 |
 
 ## Окружение (проверено 2026-11-26)
 
@@ -1239,3 +1242,122 @@ and indirect light, the local-light shadow mask»).
   результаты `--list`: `C:\GTA6_Port\recon\translate-list-AFTER.txt`, лог прогрева
   `C:\GTA6_Port\recon\warm-after-visual.log`;
 - `git status` после коммита чист; `master` не тронут.
+
+## §18. Мониторинг звёзд и perf-батч без сброса кэша (2026-11-26, ветка `visual-and-nvidia-fixes`)
+
+Задание: перед накатом perf-батча заново прочекать ВСЕ репозитории в звёздах `4EKUSHKAq` на свежее за
+последние 24–48 ч (коммиты, ветки, PR), тремя параллельными субагентами разобрать perf-PR
+(#1237/#1227/#1178/#1224) и VRAM-PR (#1240/#1258), затем главным агентом вшить совместимые фиксы,
+**не трогая `victory-shader`** (прогретый кэш 25 637 шейдеров должен остаться валидным), проверить
+`check`/`test`, собрать релиз, закоммитить, запушить и обновить HANDOFF.
+
+### 18.1. Мониторинг звёзд (субагент stars-monitor)
+
+Звёзд всего **6**; реальная активность за 48 ч (окно `2026-11-24T07:29Z → 2026-11-26T07:29Z`) — в 5.
+Итого 2085 коммитов и 5849 PR. `ivall/xcl` не существует отдельно — GitHub редиректит на `xcl-dev/xcl`.
+
+| Репозиторий | Коммитов 48 ч | PR: создано / merged | Что важно |
+|---|---|---|---|
+| `fxceless/victory-fork` (наша линия) | 167 | 1009 / 7 | вся работа через PR; **54 коммита и 45 новых PR после 00:00Z**, новейший **#1269** (07:15Z) — «больше места под текстуры на 8 ГиБ» |
+| `avatarmanz/VIctory-7900XTX` | 518 | 69 / 0 | репо создан 25.11 22:18Z; **стенд-ин непрямого света** (`VICTORY_AMBIENT`, новый `gpu/ambient.rs`), адрес view по индексу (`027e367af` — 4 из 5 `CS_TraceShadowRays`), маски над «склеенным числом» (`d1f883ecb` — последний трейсер); всё это **меняет шейдеры** |
+| `Marvisak/VIctory` (апстрим) | 486 | 2152 / 269 | вся активность — залп мержей 21:52–21:57Z 25.11; **он уже в нашем снимке** (`VICTORY_DEPTH_TWINS` #2162 и др. есть) |
+| `uiliannn/VItoriaBr` | 231 | 101 / 29 | сводные порты; автогвардинг дивергентных single-wave64 барьеров на 32-lane (NVIDIA) — близко к уже взятому #1176 |
+| `xcl-dev/xcl` | 683 | 1772 / 295 | тишина с 00:48Z; GPL-2.0, **не форк** — только идеи, код брать нельзя |
+| `Flowseal/zapret-discord-youtube` | 0 | — | попал в окно только по `updated_at` |
+
+Граница нашего снимка: в нём есть `VICTORY_DEPTH_TWINS` (#2162) и `VICTORY_SHADER_OPT`/`VICTORY_BACK_READS`,
+но нет `VICTORY_BVH_NO_HIT` из fxceless `96ff13566` (00:00:13Z 26.11) → **наш срез ≈ 25.11 22:00Z**,
+отставание от fxceless main ≈ 100+ коммитов (это и есть причина конфликтов свежих PR).
+Темы A (свет/тени): готовых фиксов HDR/tonemap/exposure/bloom за 48 ч **нет нигде** (только диагностика
+NaN в захватах #2052 и Auto HDR notice #1255); вся новизна — ray-traced свет/BVH и шейдерные порты.
+Тема B (FPS): почти всё измеренное — те самые PR, что в батче. Тема C (8 ГиБ/NVIDIA): #1269/#1250/#1258/
+#1240/#1219/#1218 + `VICTORY_SHOW_NEW_LATER` (avatarmanz `4cd2d1335`, device loss каждые ~15 мин).
+
+### 18.2. Что вшито (6 шагов, после каждого `cargo check --workspace` → exit 0)
+
+| Шаг | Что | Файлы / строки | Флаги (по умолчанию) |
+|---|---|---|---|
+| 1 | **#1237 + #1245** (upstream main `32be36d5`+`bc6ee68e`): кэш поиска host-копий на поток | `shadow.rs`, `host.rs` +223/−15 | `VICTORY_LOOKUP_CACHE` (**выкл**; `=1` вкл, `=alt` A/B 20 с) |
+| 2 | **#1227** (upstream `6aed0780`): send-and-hash в 3 шага, 29 → 6 мс card time | `host.rs` +186/−34 | `VICTORY_CARD_SYNC_BATCH` (**выкл**; `=1`, `=alt`) |
+| 3 | **#1224, только host-часть**: горячие fill'ы и «убрать в сторону» | `host.rs` +126/−6 | `VICTORY_FILL_HOT=1`, `VICTORY_BURY_ASIDE=1` (**выкл**) |
+| 4 | **#1258 + #1240** (combined): capped heap split + mip cap / RAM trim / bind cache / батч-зеркало дескрипторов | `descriptor/host.rs`, `descriptor.rs`, `draw.rs`, `host.rs`, `list.rs`, `resource.rs`, `shadow.rs`, `texture.rs` | `VICTORY_DYNAMIC_SLOTS` (авто: 393 215 title + 606 784 dynamic), `VICTORY_TEXTURE_MAX_DIM` (выкл, ≥64, нужен `LEVELS_ON_DEMAND=1`), `VICTORY_RAM_TRIM_MB` (выкл), `VICTORY_BIND_CACHE` (выкл); всегда-вкл. zero-page/slot skip, batch-mirror, memset-skip (откат `VICTORY_HEAP_SYNC_PAGE=0`) |
+| 5 | **#1269** (свежий PR 07:15Z, ручной порт 20 строк): на картах ≤8 ГиБ резерв под текстуры 10 % → 6 % | `resource.rs` +47/−8 | без флага: `VICTORY_TEXTURE_ROOM_PERCENT` по умолчанию **94** на ≤8 ГиБ, 90 на остальных; явная переменная всё ещё главнее |
+| 6 | README-блоки #1224 | `README.md` +14 | — |
+
+Итого дифф: **9 файлов, +1124/−81** (без HANDOFF). `crates/victory-shader` — **0 изменений** (проверено
+`git diff --stat -- crates/victory-shader` = пусто), поэтому ключ кэша не изменился.
+Новых тестов от PR: `capped_dynamic_slots`, `records_copied_as_bytes_are_made_at_the_next_sync`,
+`two_dirty_card_buffers_reach_readback_in_the_same_submission` (ignored, нужен адаптер), наш
+`low_vram_texture_room_default_is_higher`.
+
+### 18.3. Что НЕ взято и почему
+
+1. **#1178 (lazy GPU write-back)** — 6939 строк в 4 файлах, зависит от **14 upstream-коммитов после нашего
+   среза** (`6d20eed6`/`94ed363c`/`de4146a0`/`84c5dc00`/`1391409c`…), 3-way merge даёт 10 конфликтов, и он
+   переписывает `find_all`/`find_pieces`, где у нас уже живёт свой `VICTORY_PREFETCH` (§15). Механически
+   не собирается; нужен либо rebase автором на наш срез, либо отдельный порт «upstream main 44bff61b→dc4c0fcd».
+2. **#1224 shadow-кэш** (вторая половина PR) — дубль по смыслу с #1237 и текстовая несовместимость
+   (`shadow::lookup`/`BUFFERS` переписываются двумя разными кэшами); A/B автора нейтрален (6,60→6,61 fps).
+3. **#1226** (`translate --cache --pipelines`, 15 файлов, +2728) — самая интересная идея против нашего
+   pipeline-шторма (530–549 PSO в кадре, §14), но это отдельная задача: трогает `apps/victory`,
+   `Cargo.toml`/`Cargo.lock` и требует своей проверки.
+4. **#1250 / #1219 / #1218** (VRAM-окно, `VICTORY_TEXTURE_DROP_LEVELS`, hold reads) — по смыслу полезны,
+   но конфликтуют с нашим деревом (свежий base); нужна ручная адаптация, отложены.
+5. **Шейдерные порты по свету** (`avatarmanz 027e367af`/`d1f883ecb` на 5 `CS_TraceShadowRays`,
+   `uiliannn` #34/#79, fxceless #1263) — **меняют `victory-shader`** → сброс кэша и полный `--warm all`
+   (~250 с). Отдельная задача, как и `VICTORY_AMBIENT` (стенд-ин GI из другой линии форков).
+6. **Кэш по `TRANSLATOR_VERSION`** (avatarmanz `1162d38f9`) — убрал бы 250-с прогрев на каждый порт
+   эмиттера, но сам меняет ключ кэша; решение за пользователем.
+
+### 18.4. Проверки, сборка, кэш
+
+- `cargo check --workspace` — после каждого из 6 шагов **exit 0** (логи: `upstream\check-s1..s5*.log`).
+- `cargo test --workspace` — **exit 0**: core 11, formats 25 (+4 ignored), gpu **188** (+7 ignored; было 184/+6),
+  hle 100, loader 27+2+1, pe 7, pipeline 4, shader 216 (+3 ignored), xtask 4, doc 0. Наш новый тест
+  `resource::tests::low_vram_texture_room_default_is_higher ... ok`.
+- `cargo build --release -p victory` — **exit 0, 30,88 с**; `victory.exe` 8 592 384 Б, 12:52:25.
+- **Кэш шейдеров не сброшен** (главное требование): обычная команда прогрева вернула
+  `all hashes asked, 25889 found: 0 translated now, 25637 in the cache already, 252 do not translate;
+  4,7 s on 12 threads` — т.е. перепрогрев не нужен, все 25 637 переводов на месте.
+
+### 18.5. Итоговая команда запуска (PowerShell, из корня `C:\GTA6_Port\victory-fork`)
+
+```powershell
+$env:VICTORY_DISPLAY_MODE='1920x1080'; $env:VICTORY_LEVELS_ON_DEMAND='1'; $env:VICTORY_ASYNC_SUBMIT='1'; $env:VICTORY_QUEUE2='1'; $env:VICTORY_INDIRECT_WINDOW='1'; $env:VICTORY_TEXTURE_NO_WAIT='1'; $env:VICTORY_MERGE_GAP='64'; $env:VICTORY_MERGE_RUNS='4096'; $env:VICTORY_STAGING_POOL='0'; $env:VICTORY_COPY_PLAIN='1'; $env:VICTORY_JOIN_PARTS='1'; $env:VICTORY_BACK_OWN_VIEW='1'; $env:VICTORY_INDIRECT_GATHER='1'; $env:VICTORY_CARD_REHASH_RUNS='1'; $env:VICTORY_HOST_WAVE='32'; $env:VICTORY_VIEW_LIMIT='999999'; $env:VICTORY_LOOKUP_CACHE='1'; $env:VICTORY_CARD_SYNC_BATCH='1'; $env:VICTORY_FILL_HOT='1'; $env:VICTORY_BURY_ASIDE='1'; $env:VICTORY_BIND_CACHE='1'; $env:VICTORY_TEXTURE_MAX_DIM='1024'; .\target\release\victory.exe run 'C:\GTA6_Files\game_scarlett_master.exe' --execute
+```
+
+Что нового в команде против §8: `VICTORY_LOOKUP_CACHE=1` (117→104 мс на замере автора),
+`VICTORY_CARD_SYNC_BATCH=1` (29→6 мс card time), `VICTORY_FILL_HOT=1` + `VICTORY_BURY_ASIDE=1`
+(ручки frame-time), `VICTORY_BIND_CACHE=1` (CPU/кадр), `VICTORY_TEXTURE_MAX_DIM=1024` (главный рычаг
+VRAM — режет старшие mip'ы; при всё ещё >95 % VRAM ставить `768`), `VICTORY_TEXTURE_ROOM_PERCENT`
+**не задаём** — теперь автоматически 94 % на нашей 3060 Ti. `VICTORY_DYNAMIC_SLOTS` тоже не задаём:
+раскладка «393 215 слотов title + 606 784 dynamic» выбирается сама. `VICTORY_RAM_TRIM_MB` — опционально
+(у нас 32 ГБ ОЗУ, это про ОЗУ, не про VRAM).
+Честный A/B (если что-то пойдёт не так): у `VICTORY_LOOKUP_CACHE` и `VICTORY_CARD_SYNC_BATCH` есть
+`=alt` (20 с вкл / 20 с выкл с отметкой в логе) или `=0`.
+
+### 18.6. Риски и что смотреть в прогоне
+
+1. **#1258 (heap split)** — title-слоты 393 215…1 245 183 теперь читают dynamic-слоты; если там окажется
+   долгоживущий view, выбранный по индексу, прочитается null (автор таких не видел). В логе ждать
+   `host view heap capped at 1000000` с `fitted=393215`, следить за «no free dynamic descriptor slots».
+2. **#1240** — cap 1024 может «замылить» дальние текстуры (это компромисс за VRAM); batch-зеркало
+   дескрипторов — откат `VICTORY_HEAP_SYNC_PAGE=0`.
+3. Все новые флаги — **opt-in и на 3060 Ti ещё не измерялись** (замеры авторов: RTX 3070 8 ГиБ, 5060 Ti).
+   При артефактах снимать по одному, в порядке: `VICTORY_BURY_ASIDE`, `VICTORY_FILL_HOT`,
+   `VICTORY_CARD_SYNC_BATCH`, `VICTORY_LOOKUP_CACHE`.
+4. Ожидание по VRAM: пик был 6802/7104 МБ (96 %), 206 перезаливов текстур; с cap 1024 и 94 % под текстуры
+   ждём заметно ниже и меньше «the card has no room for more».
+5. Кэш шейдеров перегревать **не нужно** — если после правок `victory-shader` кто-то будет портировать
+   шейдерные фиксы, тогда да: полный `--warm all`.
+
+### 18.7. Файлы
+
+- Патчи и разборы: `C:\GTA6_Port\upstream\perf\` (`01-pr1237-safe.diff`, `02-pr1227-main.diff`,
+  `03-pr1224-host.diff`, `05-pr1224-README.diff`, `00-all-three-combined.diff`, `REPORT.md`, `check-*.txt`,
+  `scratch\`), `C:\GTA6_Port\upstream\vram\` (`pr1258+pr1240.combined.diff`, `pr1240.diff`, `pr1258.diff`,
+  `ANALYSIS.md`, `apply-check.txt`), `C:\GTA6_Port\upstream\fresh\` (`pr1269.diff` + метаданные #1269/#1250/
+  #1245/#1226/#1219/#1218);
+- Сырые данные мониторинга: `C:\GTA6_Port\recon\stars\` (`stars-report.md`, `commits-48h.tsv`,
+  `pr-merged-48h.tsv`, `pr-open-48h.tsv`, `pulls-all.tsv`, `topic-A/B/C-*.txt`, `commits-shader-path.tsv`);
+- Логи: `upstream\check-s1..s5*.log`, `upstream\test-after-perf.log`, `upstream\build-after-perf.log`.

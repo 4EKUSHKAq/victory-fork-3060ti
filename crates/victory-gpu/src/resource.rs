@@ -1330,11 +1330,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            let capped = crate::texture::max_dim().is_some_and(|cap| {
+                r.desc.width.max(u64::from(r.desc.height)) > u64::from(cap)
+            });
             let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
-                    || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                && (capped
+                    || (bytes >= crate::tiles::floor()
+                        && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                            || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
+                            || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0))));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
@@ -1504,11 +1508,34 @@ pub(crate) fn room_lately() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+        if let Some(percent) = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        {
+            return percent.clamp(50, 97);
+        }
+        // An 8 GiB card such as the RTX 3060 Ti reports about 7.1 GiB of
+        // budget; the old fixed 10 % reserve there starves the bindless
+        // texture queue even though the title's render targets and buffers
+        // still fit. Keep a smaller, but bounded, reserve on cards of 8 GiB
+        // or less; larger cards keep the long-tested 90 % policy. Measured
+        // runs 170-174: 94 % gives the textures back what the card copies of
+        // title buffers take (about 1,020 MB of 10,200 on the test card).
+        let budget = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget);
+        default_texture_room_percent(budget)
     })
+}
+
+/// The default [`room_percent`] for a host whose budget is `budget` bytes:
+/// 94 on cards of 8 GiB or less, 90 everywhere else (and before the host is
+/// up, when the budget is not known).
+#[cfg(windows)]
+fn default_texture_room_percent(budget: Option<u64>) -> u64 {
+    budget
+        .filter(|&bytes| bytes != 0 && bytes <= 8 * (1024u64 << 30))
+        .map_or(90, |_| 94)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -4024,5 +4051,20 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn low_vram_texture_room_default_is_higher() {
+        assert_eq!(
+            super::default_texture_room_percent(Some(8 * (1024u64 << 30))),
+            94
+        );
+        assert_eq!(
+            super::default_texture_room_percent(Some(12 * (1024u64 << 30))),
+            90
+        );
+        assert_eq!(super::default_texture_room_percent(None), 90);
+        assert_eq!(super::default_texture_room_percent(Some(0)), 90);
     }
 }

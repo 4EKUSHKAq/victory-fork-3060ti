@@ -1878,3 +1878,49 @@ M3 (async on): 4,6 fps / 219 мс медиана; M2 (off): 4,0/252; M2b (off, �
 - Анализатор: `C:\GTA6_Port\analyze-ab.ps1` (снапшот `audit\harness-analyze-ab-2026-11-26.ps1`), харнесс — `C:\GTA6_Port\run-road.ps1`, `sendkeys2.ps1` (снапшоты `audit\harness-run-road-2026-11-26.ps1`, `audit\harness-sendkeys2-2026-11-26.ps1`), проверка синтаксиса `audit\parse-check.ps1`;
 - Аудиты и патчи: `audit\f6a09d3b-audit.md`, `audit\f6a09d3b.diff`, `f6a09d3b-gpu.diff`, `f6-tiles-framelog.diff`, `audit\overlay-2095f154-audit.md`, `overlay-2095f154-adapted.diff`, `stats-2095f154.rs`, `fpsbox-2095f154.rs`, `audit\harness-audit.md`;
 - Сборка/тесты: `audit\test-overlay-f6.log`.
+
+## §23. Раунд 3: Series-S/внутренний рендер (отрицательный), `VICTORY_SETTLE_ROOM` (парный A/B), флейки тестов (2026-11-26 вечер)
+
+Ветка `feat-settle-room` от `feat-heap-worker` @ `f7dcf01`; коммит кода **`1710537`**, этот §23 — следующий коммит.
+
+### 23.1. Series-S и «внутренний 1080p» — проверено, тупик (но результат полезный)
+
+Гипотеза: если заставить титул рендерить внутри 1280×720 вместо 2560×1440, GPU-время упадёт в разы и FPS вырастет. По диагностике форка (run 304) `--console series-s` даёт present 1920×1080 и рендер 1280×720, но чёрную картинку — «не преследовали». Проверили на нашей ветке.
+
+- В харнесс добавлен параметр `-Console series-s|series-x` (прокидывается в `victory run … --console`); прогон `C:\GTA6_Port\road\s-s1` (200 с, окно 1280×720, всё остальное как в дефолте).
+- **Что подтвердилось:** `presenting to a window 1920x1080`, внутренние буферы **1280×720** (в логах вью `width=1280 height=720`), VRAM-пик **5918 МиБ** против 7794–7969 у Series X, GPU-util 29 %, GPU-ожидание 16,8 мс против 37–51 мс — то есть GPU-нагрузка реально падает.
+- **Картинка чёрная:** средняя яркость кадров 8–21 против 45–125 у Series X (виден только оверлей). Причина в логе: титул в профиле Series S идёт путём FSR4: сначала отказывается `amd_fidelityfx_upscaler_xbox.dll` (host policy), затем **29** пассов `FFX FSR4 ACO: DeserializeComputePipelineStateX FAILED hr=0x80004001 (E_NOTIMPL) … falling back to NewBE` — апскейл с 720p на 1080p не выполняется, кадр в back buffer не попадает.
+- **Даже без черноты это не рычаг:** при равных draws (4500–5500) Series S — **172,1 мс** против 168,8 мс у Series X; copies на CPU **86,5 мс/89 МБ** против 60 мс/124 МБ (меньше байт, но медленнее — путь «чёрного» кадра делает лишние копии), preparing 145,7 против 112,2 мс. Кадр упирается в CPU-сторону (preparing + copy-back), а не в разрешение рендера.
+- Возможное будущее: реализовать `DeserializeComputePipelineStateX`/разрешить AMD-апскейлер, но выигрыш ожидается небольшой (CPU-bound); в этом раунде не преследуем.
+
+### 23.2. `VICTORY_SETTLE_ROOM` (из `06702fe8`) — порт и честный парный A/B: эффекта в нашей сцене нет
+
+Коммит `06702fe8` форка (+1456/−64, 19 файлов) смешивает несколько вещей: больше места флайтам до сеттла (`SETTLE_ROOM`), compute-диспетчи >65 535 групп по z, BC7-поворот, `REASK_BLANK`, `DENY_PIPELINES`, инструменты DirectStorage, правки `victory-shader` (эмиттер — нам нельзя, кэш 76 973 файла). Взяты **только два хунка `SETTLE_ROOM`** в `host.rs` (+45/−2): `late_most()` ×2 при включённом переключателе, `stale_under_flights()` — лимит изменённых ранов ×8; плюс режим `alt` (20 с вкл / 20 с выкл, каждое переключение пишется в лог) — ровно для парного замера в одном прогоне. Шейдерная часть не тронута, новых аллокаций/VRAM нет.
+
+Проверки: `cargo check --workspace` = 0; `cargo test --workspace` — **612 passed, 0 failed** (со 2-й попытки; см. 23.3), release собран (31,1 с). В харнесс добавлен `-SettleRoom 1|alt|''`, анализатор `C:\GTA6_Port\analyze-settle-room.ps1`.
+
+**A/B: два прогона с `-SettleRoom alt`** (`road\sr1`, `road\sr2`; 480 с, worker/bake=20/ambient как в дефолте; 24 переключения на прогон; по 30–33 кадра мира в каждом состоянии):
+
+| Прогон | ON (ms/fps) | off (ms/fps) | разница |
+|---|---|---|---|
+| sr1 | 158,1 / 6,3 | 174,4 / 5,7 | −9,3 % ms |
+| sr2 | 175,7 / 5,7 | 168,0 / 6,0 | +4,6 % ms |
+
+Сравнение при равных draws (главный способ — сцена за 20-секундные окна разная): объединённо по двум прогонам, корзина **4500–5500 draws** — **ON 165,4 мс (n=48) против off 166,8 мс (n=46), −0,8 %**; корзина 4500–5000 — −2,9 % (n=78); settle-ожидание «ms waiting for the card»: sr1 −4,2 мс, sr2 +1,4 мс. т.е. **систематического выигрыша в кадре нет** (у автора замер давал −11,5 мс *работы готовящего потока* на лодочном сейве, а не кадра; наши сцены/железо другие). Код оставлен **выключенным по умолчанию** (opt-in `VICTORY_SETTLE_ROOM=1`, `alt` — для парных замеров); в дефолтную команду не включён.
+
+### 23.3. Флейки тестов (важно для дальнейших шагов)
+
+На этой машине плавают два warp-теста GPU-эмуляции: `indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields` и `inplace::tests::warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` (гонка порядка волн на GPU). Замерено: на **чистом baseline** (без `SETTLE_ROOM`) — 2 прохода из 3, с `SETTLE_ROOM` — 5 из 10; полный `cargo test --workspace`: попытка 1 — 248 passed/1 failed (тот самый warp-тест), попытка 2 — **612 passed/0 failed**. Т.е. флейк не связан с нашими правками; для приёмки — ретраить до зелёного (как в CI форка: gpu-тесты гоняются по одному). В отчётах теперь фиксируем это явно.
+
+### 23.4. Что дальше (по убыванию ожидаемой пользы)
+
+1. **`ceb9e1f7` — `VICTORY_PARALLEL_REFRESH=1|alt`** (проверки текстур на helper-потоках; у автора −8,7/−9,4 мс preparing, 6 файлов +270/−6): следующий кандидат; у него есть `alt` — можно померить парно в одном прогоне, как здесь.
+2. **Бескодовые эксперименты по копиям**: у нас copies ~62 мс/126 МБ и copy-back ~82–128 мс за кадр — главная стена. В дереве уже есть switch'и `VICTORY_CARD_WINDOWS_MB` (копии окон тайтла в памяти карты, «fewer long frames»), `VICTORY_WINDOW_UPLOAD=1` (прямая запись в память карты через upload heaps), `VICTORY_CARD_BUFFERS_MIN_KB/MB` (буферные копии в памяти карты) — не проверялись; нужен аккуратный A/B с контролем VRAM (у нас 7,8–8,0 из 8,2 ГБ, сперва освободить запас, например `VICTORY_TEXTURE_MAX_DIM=768`, и мерить попарно).
+3. Series-S возвращаться только если появится реальный путь FSR4/апскейлера — и то как визуальная опция, не как FPS-рычаг.
+
+### 23.5. Файлы
+
+- Прогоны: `C:\GTA6_Port\road\{s-s1,sr1,sr2}\` (captions/err/watch/keys/vram, env.txt, shots), плюс анализатор `analyze-settle-room.ps1` (снапшот `audit\harness-analyze-settle-room.ps1`);
+- Порт: `audit\settle-room.diff` (минимальный патч), `audit\c-06702fe8.diff` (полный коммит), `audit\c-ceb9e1f7.json` (следующий кандидат);
+- Тесты: `audit\test-settle-room-attempt1.log` (флейк), `attempt2.log` (зелёный), `test-settle-room.log`;
+- Харнесс: `C:\GTA6_Port\run-road.ps1` (`-Console`, `-SettleRoom`), снапшот `audit\harness-run-road-2026-11-26b.ps1`.

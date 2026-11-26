@@ -2352,6 +2352,7 @@ impl HostHeap {
         for (index, handle, key, view) in active {
             let Some(view) = view else {
                 made[index as usize] = 0;
+                self.forget_tiled(index);
                 if self.sampler {
                     self.null_sampler(index);
                 } else {
@@ -2374,11 +2375,16 @@ impl HostHeap {
                 continue;
             }
             made[index as usize] = if later { 0 } else { key };
-            // The copy pass keeps only the resource the view was made from
-            // (`make` returns the tiled handle too, #764); the slots it makes
-            // are in `placed` (not tabled), so the levels-on-demand pass
-            // already remakes them. `tiled_shown` is for the draw path
-            // (`mirror`), which is the one tabled slots take.
+            // A slot made here, by the pass over records the title copied in
+            // as bytes, is not the draw path's (`mirror`): record the tiled
+            // handle too (#764), so that `texture_views_remade` finds the slot
+            // when the texture's first level with memory changes, and
+            // `tiled_stale` sees it in `mirror`. A slot left out of `placed`
+            // (a table's slot, with `VICTORY_HEAP_SYNC_TABLES=1`) was found by
+            // neither, and went on showing the level it was made with: the
+            // tiles of that level are given back and given to another texture,
+            // and the slot reads them in its place (plates of another
+            // texture's levels).
             let built = if later {
                 None
             } else {
@@ -2395,7 +2401,11 @@ impl HostHeap {
             if built.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            let kept = built.and_then(|m| m.kept);
+            let (kept, tiled) = match built {
+                Some(made) => (made.kept, made.tiled),
+                None => (None, None),
+            };
+            self.record_tiled(index, &view, tiled);
             keep_updates.push((index, kept));
         }
 
@@ -2407,6 +2417,7 @@ impl HostHeap {
                     Some(view) => null_for(&view, self.cpu(slot)),
                     None => null_view(self.cpu(slot)),
                 }
+                self.forget_tiled(slot);
                 keep_updates.push((slot, None));
             }
         }
@@ -4398,6 +4409,79 @@ mod heap_size_tests {
         assert_eq!(on_demand.tiled().unwrap().first_shown(), Some(0));
         assert!(heap.tiled_stale(3));
         assert!(heap.mirror(3, handle, true).is_some());
+        assert!(!heap.tiled_stale(3));
+
+        // Clean up RESHOWN + reservation.
+        let _ = heap.texture_views_remade();
+        // SAFETY: freeing our private reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    /// End-to-end check with `VICTORY_LEVELS_ON_DEMAND=1`: a slot the pass over
+    /// the title's copied-in descriptor records makes
+    /// (`mirror_copied_batch`) is tracked in `tiled_shown` like the draw path's
+    /// (`mirror`), so it is found by `texture_views_remade()` when the
+    /// texture's `first_shown()` changes. The slot is a table's
+    /// (`texture_slot_tabled`, as with `VICTORY_HEAP_SYNC_TABLES=1`), so it is
+    /// left out of `placed` (`Spans`) and only `tiled_shown` can find it; a
+    /// slot tracked by neither went on reading the tiles another texture was
+    /// given (plates of another texture's levels on the water).
+    #[test]
+    fn copy_pass_tiled_slot_remakes_when_first_shown_changes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !crate::tiles::wanted() {
+            return; // only runs under VICTORY_LEVELS_ON_DEMAND=1
+        }
+        use windows_sys::Win32::System::Memory::*;
+        // 1024x1024 BC7, 11 mips (~1.33 MiB >= the 1 MiB floor), partly mapped
+        // so `resource::texture_at` makes a levels-on-demand `Tiled` texture.
+        let rdesc: [u32; 14] = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).unwrap() as usize;
+        // SAFETY: private reservation with only the tail committed (partly mapped).
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: commit the first 64 KiB only, as a texture streaming in.
+        let committed = unsafe { VirtualAlloc(base, 65536, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+
+        let addr = base as u64;
+        let mut sdesc = [0u32; 16];
+        sdesc[0] = 98; // BC7_UNORM
+        sdesc[1] = 4; // TEXTURE2D
+        sdesc[2] = 5768; // default component mapping
+        sdesc[4] = 0; // MostDetailedMip
+        sdesc[5] = 11; // MipLevels
+        sdesc[10] = addr as u32;
+        sdesc[11] = (addr >> 32) as u32;
+
+        // The record the title copied into its heap for slot 3, and the table
+        // mark that leaves the slot out of `placed`.
+        let mut handle_words = [0u32; 8];
+        let handle = handle_words.as_mut_ptr() as u64;
+        super::super::record(handle, View::Placed(false, rdesc, sdesc));
+        // SAFETY: the words `record` wrote into our own handle.
+        let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        heap.texture_slot_tabled(3, true);
+        heap.mirror_copied_batch(&[(3u32, handle, words)], crate::frame::current());
+
+        // The slot was made, is left out of `placed`, and only `tiled_shown`
+        // can say where it starts.
+        assert!(heap.made(3));
+        assert!(heap.placed.lock().unwrap().slots_at(addr).is_empty());
+        assert_eq!(heap.tiled_shown.lock().unwrap().slots_at(addr), vec![3]);
+
+        // An upload gives mips 3..11 tiles: the first level shown changes.
+        let placed = crate::resource::texture_at(addr, &rdesc).unwrap();
+        let on_demand = crate::resource::host_tiled(placed).expect("expected tiled texture");
+        let mask = ((1u32 << 11) - 1) & !0b111; // mips 3..10
+        let _ = on_demand.uploaded(mask, addr);
+        assert_eq!(on_demand.tiled().unwrap().first_shown(), Some(3));
+        assert!(heap.tiled_stale(3));
+
+        // The texture pass finds the slot by its start and makes it again.
+        assert!(heap.texture_views_remade() >= 1);
         assert!(!heap.tiled_stale(3));
 
         // Clean up RESHOWN + reservation.

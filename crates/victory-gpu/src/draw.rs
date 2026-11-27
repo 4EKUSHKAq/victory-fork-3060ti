@@ -1,4 +1,4 @@
-//! Draws on the host GPU (decision 0007, step 3). A list keeps the state
+﻿//! Draws on the host GPU (decision 0007, step 3). A list keeps the state
 //! the title sets for its draws (pipeline, descriptor heaps, root
 //! arguments, vertex and index buffers, targets); each draw then brings the
 //! host list up to date: the host pipeline and our root signature, the
@@ -561,14 +561,14 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Final arguments sent to each host root signature (graphics, compute).
     root_bindings: [RootBindings; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) в†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) в†’ dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -688,8 +688,8 @@ mod root_binding_tests {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -711,8 +711,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -1783,7 +1783,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1847,7 +1847,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3814,7 +3814,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

@@ -13,7 +13,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Identity of a host heap instance ([`HostHeap::id`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Identity of this host heap instance, checked by [`HostHeap::release`]
+    /// so that a stale list resetting after a title heap was replaced at the
+    /// same address does not free slots belonging to the new heap (port of
+    /// `fxceless/victory-fork` #1324 / commit 52ac4ec through
+    /// `trustno1-coder/VIctory-NVIDIA` commit 47747d6, GPL-3.0-or-later).
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1151,6 +1160,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1880,11 +1890,21 @@ impl HostHeap {
         stale
     }
 
+    /// Identity of this host heap instance (see [`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` is this host heap's identity: a list resetting
+    /// after the title replaced its heap at the same address must not free the
+    /// slots of the heap that took the address.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -4564,9 +4584,31 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Dynamic slots go back only to the host heap instance that took them: a
+    /// stale list resetting after the title replaced its heap at the same
+    /// address must not free the new heap's slots (fxceless #1324, through
+    /// trustno1-coder/VIctory-NVIDIA 47747d6, GPL-3.0-or-later).
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let after_alloc = a.free.load(std::sync::atomic::Ordering::Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(
+            a.free.load(std::sync::atomic::Ordering::Relaxed),
+            after_alloc,
+            "releasing with another heap's identity must not free slots"
+        );
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), after_alloc + 2);
     }
 
     /// A title heap too big for a capped host heap (NVIDIA: the null slot

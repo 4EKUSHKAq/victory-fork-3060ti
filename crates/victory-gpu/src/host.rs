@@ -39,6 +39,16 @@ const RTV_RING: u32 = 1024;
 /// Whether the host device has GPU upload heaps (asked when it is made).
 static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The widest wave the host GPU runs (0: not known), asked when the device
+/// is made. 32 (NVIDIA) is the host the pipeline skips look at (the water's
+/// tiled light, left out below).
+static MAX_WAVE: AtomicU32 = AtomicU32::new(0);
+
+/// The widest wave the host GPU runs (0: not known).
+pub(crate) fn host_max_wave() -> u32 {
+    MAX_WAVE.load(Ordering::Relaxed)
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -757,6 +767,7 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            MAX_WAVE.store(o1.WaveLaneCountMax, Ordering::Relaxed);
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
         // Whether the card's own memory can be mapped by the CPU ("GPU

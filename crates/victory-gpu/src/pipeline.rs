@@ -616,6 +616,100 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     code_of(code).map(|b| shader(stage, unsafe { &*b }))
 }
 
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a
+/// group, which a host of 32-lane waves gets in the wave-wide form only
+/// (the 4 and 7 branches taken wave-wide). In that form they leave whole
+/// tiles of open water dark — around boats, along shores, under bridges —
+/// and took about 15 ms of the card a frame on an RTX 5070 (25 fps with
+/// them, 30 without, the blocks gone; trustno1-coder/VIctory-NVIDIA, commit
+/// 35c156087e, and fxceless/victory-fork's README of 2026-11-27 names the
+/// same two programs and form). Left out there, the water has no light of
+/// its own depth (darker, bluer) and no blocks; `VICTORY_WATER_LIGHT=1`
+/// runs them as before.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+/// What the host and the switches allow, asked once per run.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct Skipping {
+    host_wave: u32,
+    /// `VICTORY_WATER_LIGHT=1`: run the water's tiled light.
+    water_light: bool,
+    /// `VICTORY_BVH_BUILDER=1`: the ray-tracing structures are built.
+    bvh_builder: bool,
+    /// `VICTORY_RT_RESOLVE=1`: run the ray-tracing resolve without the builder.
+    rt_resolve: bool,
+    /// `VICTORY_ACTIVATE_RAYS`: run the screen probes' ray activation.
+    activate_rays: bool,
+}
+
+#[cfg(windows)]
+fn skipping() -> &'static Skipping {
+    static ASKED: OnceLock<Skipping> = OnceLock::new();
+    ASKED.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let builder = on("VICTORY_BVH_BUILDER");
+        let s = Skipping {
+            host_wave: crate::host::host_max_wave(),
+            water_light: on("VICTORY_WATER_LIGHT"),
+            bvh_builder: builder,
+            rt_resolve: on("VICTORY_RT_RESOLVE"),
+            activate_rays: if builder {
+                std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v != "0")
+            } else {
+                on("VICTORY_ACTIVATE_RAYS")
+            },
+        };
+        tracing::debug!(?s, "shaders left out by the host and the switches");
+        s
+    })
+}
+
+/// Whether one of `shaders` is the compute program `name` names (its DXIL
+/// entry point is in its container).
+#[cfg(windows)]
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+#[cfg(windows)]
+fn left_out_with(s: &Skipping, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !s.water_light && s.host_wave == 32 && shaders.iter().any(|sh| WATER_LIGHT.contains(&sh.hash.as_str())) {
+        return Some(
+            "the water's tiled light on a host of 32-lane waves leaves tiles of open water dark \
+             (VICTORY_WATER_LIGHT=1 runs it)",
+        );
+    }
+    if !s.bvh_builder && !s.rt_resolve && named(shaders, b"CS_RaytracingResolve") {
+        return Some(
+            "a program that shades ray-tracing hits without BVH (VICTORY_RT_RESOLVE=1 runs it)",
+        );
+    }
+    if !s.activate_rays && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("the screen probes' ray activation (VICTORY_ACTIVATE_RAYS=1 runs it)");
+    }
+    None
+}
+
+/// Why the title's pipeline of `shaders` is left out for the whole run
+/// (`None`: it runs). Asked at the pipeline's creation
+/// ([`make::Pending::new`]); the first reason is logged once.
+#[cfg(windows)]
+pub(crate) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let why = left_out_with(skipping(), shaders)?;
+    static SAID: Mutex<Option<Vec<&'static str>>> = Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    let said = said.get_or_insert_with(Vec::new);
+    if !said.contains(&why) {
+        said.push(why);
+        tracing::info!(?shaders, why, "a pipeline is left out for the whole run");
+    }
+    Some(why)
+}
+
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
@@ -1032,6 +1126,81 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Switches for the left-out tests: a 64-lane host, no switch set.
+    #[cfg(windows)]
+    fn switches() -> Skipping {
+        Skipping {
+            host_wave: 64,
+            water_light: false,
+            bvh_builder: false,
+            rt_resolve: false,
+            activate_rays: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn fake_shader(stage: &'static str, hash: &str, container: &[u8]) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash: hash.into(),
+            container: container.to_vec(),
+            ambient: None,
+            translated: OnceLock::new(),
+            walks: OnceLock::new(),
+        })
+    }
+
+    /// The water's tiled light is left out only on a host of 32-lane waves,
+    /// and `VICTORY_WATER_LIGHT=1` runs it as before.
+    #[cfg(windows)]
+    #[test]
+    fn the_water_light_is_left_out_only_on_a_host_of_32_lane_waves() {
+        let water = fake_shader("compute", WATER_LIGHT[0], b"");
+        let other = fake_shader("compute", WATER_LIGHT[1], b"");
+        let mut s = switches();
+        assert_eq!(left_out_with(&s, &[water.clone(), other.clone()]), None, "64-lane host runs it");
+        s.host_wave = 32;
+        assert!(left_out_with(&s, &[water.clone()]).is_some(), "32-lane host leaves it out");
+        assert!(left_out_with(&s, &[other]).is_some(), "both programs are left out");
+        s.water_light = true;
+        assert_eq!(left_out_with(&s, &[water]), None, "VICTORY_WATER_LIGHT=1 runs it");
+        s.water_light = false;
+        assert_eq!(
+            left_out_with(&s, &[fake_shader("compute", "0123456789abcdef", b"")]),
+            None,
+            "only the two programs are left out"
+        );
+    }
+
+    /// The ray-tracing resolve and the screen probes' ray activation are
+    /// left out without the structure builder; the escape switches run them.
+    #[cfg(windows)]
+    #[test]
+    fn ray_tracing_programs_are_left_out_without_the_builder() {
+        let resolve = fake_shader("compute", "0123456789abcdef", b"prefix CS_RaytracingResolve tail");
+        let activate = fake_shader("compute", "fedcba9876543210", b"CS_ScreenProbes_ActivateRays");
+        let mut s = switches();
+        s.water_light = true;
+        assert!(left_out_with(&s, std::slice::from_ref(&resolve)).is_some(), "resolve without BVH");
+        assert!(left_out_with(&s, std::slice::from_ref(&activate)).is_some(), "activate rays without BVH");
+        assert_eq!(
+            left_out_with(&s, &[fake_shader("pixel", "0123456789abcdef", b"CS_RaytracingResolve")]),
+            None,
+            "a shader of another stage is not named"
+        );
+        s.rt_resolve = true;
+        assert_eq!(left_out_with(&s, std::slice::from_ref(&resolve)), None, "VICTORY_RT_RESOLVE=1 runs it");
+        assert!(left_out_with(&s, std::slice::from_ref(&activate)).is_some(), "activate still left out");
+        s.bvh_builder = true;
+        s.activate_rays = true;
+        assert_eq!(left_out_with(&s, &[resolve, activate]), None, "with the builder both run");
+        s.activate_rays = false;
+        assert!(
+            left_out_with(&s, &[fake_shader("compute", "fedcba9876543210", b"CS_ScreenProbes_ActivateRays")]).is_some(),
+            "VICTORY_ACTIVATE_RAYS=0 leaves it out with the builder too"
+        );
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

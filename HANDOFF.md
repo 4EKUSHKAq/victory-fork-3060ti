@@ -506,3 +506,47 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 **B4 (закреплено):** свет по умолчанию `AMBIENT=0.5`, `AMBIENT_SPECULAR=0.3,0.15` (в обоих скриптах), `NATIVE_1440P=1` + `-RenderScale 0.5` (нормальный 2K-UI: «ВЫБОР УЧЁТНОЙ ЗАПИСИ» 246×30 px против 355×38 при 1080p), `FPS_COUNTER=all`, `TILES_SMALL=512`, `VICTORY_DLSS=0`. Региональные метрики `r12-analyze.ps1` по кадрам B4 ещё не снимались (следующий сеанс вместе с B2 и `RT_SHADOW=lit`).
 
 **Факты для следующего шага:** провал `r12-run2` — это не диск/pagefile (active time 1 %, avg 0.9 мс, pagefile 0.99/5.5 ГБ): узкое место — GPU 0,9–1,3 с + relay copy-back при полной VRAM (5,86/8,19 ГБ, host-копии 1018 MB). Приоритеты: бюджеты 8 ГБ (#26) и перекрытие copy-back с GPU, затем B2.
+
+## 36. Раунд 13 — бюджеты 8 ГБ (`101Leafy #26`), честный 1080p-рендер (`RENDER_SCALE=0.75`), `VICTORY_RT_SHADOW=lit`, полная телеметрия
+
+Ветка **`main-3060ti`**. Коммиты: **`c42ffbb`** (бюджеты), **`3b4208c`** (`VICTORY_RT_SHADOW=lit`), этот docs. `victory-shader` не тронут.
+
+### 36.1. Радар (read-only, 5+ репозиториев)
+- **101Leafy/victory-leafy PR #26** (`d4aff42e4e`, open, CONFLICTING): ресурсная половина перенесена; `pool.rs`-половина (spares, до 64×64 MiB) **не переносима** — у нас нет `pool.rs` (есть только `shadow::card_room_kept` + 256 MiB staging spares). Оговорка автора PR: на 7 122 MB бюджета и 2 499 MB живых таргетов резерв всё равно упирается в 0 — на нашем пике 5.8–6.7 GB выигрыш может не связать; в прогонах «no room on the card» остался (44 строки/прогон).
+- **trustno1 #19** (`0a8cd3ef5e`, docs): «тёмные комнаты — это пропорциональный bound оценки ambient-стенд-ина, а не свет-ручка» → отсюда реализация `RT_SHADOW=lit` (ниже); таблица shadow-mask при выключенных RT-трассерах не пишется вовсе.
+- Прочее: Belobug #540 (ambient-фолбэк не готовит BVH-пайплайны), #223 (room_percent vs vram_keep), fxceless #1466/#1431 (copy-back/landing), victory-leafy #24 (CSV-гейджи — телеметрия под #26), Marvisak #3457 (LRU shadow-бюджет). trustno1: новых DLSS/RT-коммитов после `3f60eeee0b` нет.
+- Важно: у Marvisak нет мерджей с 2026-11-26, ~50 открытых PR — необзоренный поток; trustno1 `826ba150c8` уже портирован (Раунд 12).
+
+### 36.2. Шаг 1 — бюджеты под 8 ГБ (`c42ffbb`)
+`resource.rs`: `targets_room_most(budget, asked)` — резерв `min(3072 MB, budget/4)` → на 8 GB-карте **2 GiB** (реальный DXGI-бюджет 7.1–7.4 GiB → ~1.8 GiB) вместо плоских 3072 MB; env `VICTORY_CARD_ROOM_FOR_TARGETS_MB` остаётся override. Прокинут в `room()`, `host::readonly_upload`/`rebar_copy`; тест `the_targets_reserve_follows_the_card_budget` (24/12/8/4 GiB). Гейт: check 0, test 0 failed (флейк §23.3 пропущен).
+Телеметрия: `audit/round13/r13-analyze.ps1` — процентили frametime/FPS min/p50/p90/p95/p99/max, фризы >150/>500 мс, стадии preparing/copies/textures/GPU/copy-back, dropped/indirect, «no room on the card», tiles_black, readback reused/made, VRAM peak/mean, GPU util/clock/power, топ CPU-потоков, commit.
+
+### 36.3. Шаг 2 — `VICTORY_RT_SHADOW=lit` (`3b4208c`)
+Реализован как **мягкий lit-уровень в нашем ambient-стенд-ине** (`ambient.rs::raise`), а не правка таблицы масок: по trustno1 #19 тьма идёт от пропорционального bound оценки (`found >= 0.2*all` → 0 в тёмной комнате), а сама таблица при выключенных трассерах не пишется. При `VICTORY_RT_SHADOW=lit` (или числе 0.01–2, default share 0.35) к `was` добавляется `found * share` — комнаты/лица становятся тусклыми, не угольными. **Off по умолчанию**, тест парсинга. Гейт: check 0, test 0 failed.
+Диагностический дамп классов `R32_UINT`-масок **не снимался** (нужен diag-билд + прогрев его кэша) — следующий сеанс.
+
+### 36.4. Шаг 3 — релиз и два тихих прогона (240 с, `NATIVE_1440P=1`, `RENDER_SCALE=0.75` = 1920×1080 честного рендера)
+Релиз 9 341 952 B. Скрипты: `RenderScale=0.75`, `AMBIENT=0.5`, `SPECULAR=0.3,0.15`, `BAKE=25`, `FPS_COUNTER=all`, `WATCH_STATS=1`, `TILES_SMALL=512`, тихий харнесс.
+
+| метрика (world) | Run 1 `RT_SHADOW=off` | Run 2 `RT_SHADOW=lit` |
+|---|---|---|
+| кадры n | 162 | 171 |
+| p50 | **7 fps / 144,4 мс** | **8 fps / 132,4 мс** |
+| p90 | 294,3 мс | **540,4 мс** |
+| p95 / p99 | 350,6 / 474,8 | 555,4 / 855,1 |
+| max | 2 245,0 мс | **7 893,0 мс** |
+| фризы >150 / >500 мс | 70 / **2** | 75 / **22** |
+| стадии p50: preparing / copies / textures / GPU / copy-back | 97,2 / 64,6 / 8,6 / 15,7 / 47,8 мс | 74,7 / 48,4 / 7,6 / 13,2 / 31,5 мс |
+| GPU p90 | 28,9 мс | 74,1 мс |
+| dropped p50/p90 | 114 / 521 | 107 / 404 |
+| VRAM peak / mean | 7 524 / 5 744 MB | 7 544 / 5 897 MB |
+| GPU util p50/p90 | 38 / 69 % | 34 / 65 % |
+| процесс commit | 20 026 MB | 19 120 MB |
+
+Прогоны **не сцен-матчены** (разные сцены/маршруты), поэтому A/B `lit` vs `off` по кадрам неубедителен: в run2 тяжелее сцена (max 7.9 с, p90 540 мс), при этом copy-back/подготовка в среднем дешевле. **`RT_SHADOW` остаётся opt-in (off by default)** до сцен-матча и региональных метрик; бюджеты 8 ГБ оставлены включёнными (регрессии по кадрам не видно, «no room» сохраняется, но это отдельная причина — тайлы/сцена).
+
+### 36.5. Осталось
+1. Сцен-матч A/B `RT_SHADOW=off/lit` + региональные метрики (скрипт `r12-analyze.ps1` при вызове из нового анализатора отдал только баннер — починить вызов/пути).
+2. diag-билд + прогрев кэша + `VICTORY_CAPTURE` → дамп классов масок и non-finite экспозиции; по нему решить, нужен ли отдельный mask-фолбэк поверх lit-флора.
+3. Бюджеты: проверить, снизились ли перезаливы тайлов на сцене у машины копов при равных `draws`-корзинах; кандидаты: victory-leafy #24 (CSV-гейджи), Belobug #540, #223, fxceless #1466/#1431.
+4. `VICTORY_DELTA_LAND` (батчевый) — довести до отсутствия регрессии, иначе оставить off.

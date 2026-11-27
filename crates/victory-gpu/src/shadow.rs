@@ -1408,8 +1408,8 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 /// point is to cut the number of `write_mapped` calls, which the loading storm
 /// of a cutscene turns into a per-run stall (Round 12: a frame's copy-back went
 /// from ~20 ms to 0.8-1.8 s with `VICTORY_DELTA_LAND=1`).
-const DELTA_GAP: usize = 512;
-const DELTA_RUNS: usize = 64;
+const DELTA_GAP: usize = 3072;
+const DELTA_RUNS: usize = 8;
 
 /// The changed runs, those closer than [`DELTA_GAP`] merged into one.
 fn merged_delta_runs(runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -1486,17 +1486,21 @@ mod difference_tests {
     }
 
     /// Runs closer than the gap are written as one call; runs further apart
-    /// keep their own, so a storm of small writes becomes a few bigger ones.
+    /// keep their own, so a storm of small writes becomes a few bigger ones
+    /// (Round 14: the 3 KiB gap and at most 8 calls per piece are what cuts
+    /// the per-call watch bookkeeping of the loading storms).
     #[test]
     fn nearby_delta_runs_are_written_as_one() {
-        let runs = [(3, 2), (10, 1), (3000, 4), (3600, 1)];
+        let runs = [(3, 2), (10, 1), (8000, 4), (12000, 1)];
         assert_eq!(
             super::merged_delta_runs(&runs),
-            vec![(3, 8), (3000, 4), (3600, 1)],
-            "the 512-byte gap joins 3..5 and 10; 3000 and 3600 stay apart"
+            vec![(3, 8), (8000, 4), (12000, 1)],
+            "the 3072-byte gap joins 3..5 and 10; 8000 and 12000 stay apart"
         );
         assert_eq!(super::merged_delta_runs(&[(7, 1)]), vec![(7, 1)]);
         assert_eq!(super::merged_delta_runs(&[]), vec![]);
+        assert_eq!(super::DELTA_RUNS, 8, "at most eight write_mapped a piece");
+        assert!((2048..=4096).contains(&super::DELTA_GAP));
     }
     /// The delta landing's runs are exactly the bytes that differ, in order,
     /// with runs split by bytes that stay equal.

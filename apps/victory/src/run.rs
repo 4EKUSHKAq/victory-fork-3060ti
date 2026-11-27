@@ -85,6 +85,12 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // Round 11: with the title's FidelityFX path asked for (`VICTORY_UPSCALER=7`
+    // or `VICTORY_DLSS=<mode>`, `victory_loader::upscaler`), its imports of
+    // `amd_fidelityfx_loader_xbox.dll` are bound to our interposer: it reads the
+    // upscale dispatch DLSS would take and hands it back to the title's own
+    // upscaler (the Streamline engine is the next step; audit\dlss-prep.md).
+    let with_ffx = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -101,13 +107,20 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    show(&exe_name, image.bind_imports(&with_ffx, policy)?);
     // The output size and the render scale (`VICTORY_FORCE_1080P=1`: output
     // 1920x1080 and the title's own render scale 1.0, so the title itself makes
     // its back buffers and render targets 1920x1080; `VICTORY_OUTPUT` and
     // `VICTORY_RENDER_SCALE` for their own values): title code changed at load,
     // each place compared byte for byte first (`force_1080p`).
     let image_size = image.info().size_of_image as usize;
+    // The title's own FidelityFX path at the asked mode (renderer 7, the
+    // scaled scene, its own upscaler; `VICTORY_UPSCALER=7`/`VICTORY_DLSS`):
+    // title code changed at load, each place compared byte for byte first.
+    if let Some(mode) = victory_loader::upscaler::asked() {
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::upscaler::apply(image.base(), image_size, mode) };
+    }
     // SAFETY: the image stays mapped and nothing of it has run yet.
     unsafe { victory_loader::force_1080p::apply_asked(image.base(), image_size) };
     if !execute {

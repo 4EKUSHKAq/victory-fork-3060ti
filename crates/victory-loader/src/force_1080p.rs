@@ -172,6 +172,11 @@ pub fn asked_render_scale() -> Option<f32> {
         }
         return scale;
     }
+    if let Some(mode) = crate::upscaler::asked() {
+        // The title's FidelityFX path draws the scene at this share of the
+        // output (the upscaler patch sets the same scale for its own pass).
+        return Some(mode.scale());
+    }
     if native_1080p() || native_1440p() {
         return Some(1.0);
     }

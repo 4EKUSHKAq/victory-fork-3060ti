@@ -2493,3 +2493,78 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 
 - Ветка **`feat-r9-async-copyback-and-water`** запушена в `myfork` (`4EKUSHKAq/victory-fork-3060ti`) после этого коммита; режим — Series X.
 - Round 10: (1) `DELTA_LAND` переделать (батч изменённых run'ов в один `write_mapped`, замер landing); (2) сцен-матчевый A/B-маршрут (фиксированная камера, boat-сцена) для решения по `ASYNC_COPY_BACK`/`EXACT_TEXBACK`; (3) если флаги не дают стабильного выигрыша — вернуться к wave64 (3 refused CS) и VRAM-политике 75/85/92 % из xcl.
+
+## 33. Раунд 10 — вода/RT-скипы, view-heap, native 1440p, AMBIENT_SPECULAR, DLSS-аудит
+
+Дата: 27.11.2026. Ветка **`feat-r10-water-heapcap-and-1440p`** (от `feat-r9-async-copyback-and-water` @ `90c9da5`), режим Series X, окно 1280×720 topmost, сессия — 3060 Ti 8 GB. `victory-shader` **не тронут ни одним коммитом** (`git diff --name-only 90c9da5..HEAD` не содержит его), кэш `shaders-r8-group2` цел (25 641 файл, не переписывался).
+
+### 33.1. Коммиты раунда
+
+| коммит | что |
+|---|---|
+| `98d4a88` | docs(agents): радар Шага 0 — 6 NVIDIA-деревьев + обязательный `gh pr list` апстрима в каждом раунде |
+| `a7fe4e8` | perf(gpu): water-light скип на 32-lane (5dc3b259…, 6f225b64…) + RT resolve/activate-rays без BVH (VIctory-NVIDIA 35c156087e) |
+| `d7391d7` | perf(gpu): проба view-heap лимита при создании устройства (host-часть PR #3476; ядро клампа уже было в дереве) |
+| `3b8c017` | feat(loader): `VICTORY_NATIVE_1440P` — SDR display mode + Settings viewport + temporal scale + output 2560×1440 (DexNom через VIctory-NVIDIA) |
+| `71d3293` | feat(gpu): `VICTORY_AMBIENT_SPECULAR` — отражения без RT (VIctory-NVIDIA / foxhound, без ONCE) |
+| (этот) | docs: HANDOFF §33 |
+
+### 33.2. Шаг 0 — радар AGENTS.md
+
+П. 8 дополнен: обязательный обход `trustno1-coder/VIctory-NVIDIA`, `readmet3xt-lab/foxhound`, `Steenax6/VIctory-NVID`, `Xeltax/VIcky`, `101Leafy/victory-leafy`, `Fayberr/Victory-United`; чужой exe не запускать (только исходники/диффы); `gh pr list -R Marvisak/VIctory --state open --limit 100` в каждом раунде; provenance-нота в коммите каждого порта.
+
+### 33.3. Шаг 1 — вода/RT-скипы и PR-решения
+
+- **Вода/RT (из `VIctory-NVIDIA` 35c156087e).** На 32-lane хосте `CS_TransmissionVolumetrics_Tiled` (5dc3b25986622949) и `_Tiled_LocalLights` (6f225b641c5b0708) идут только в wave-wide форме и оставляют тёмные плиты открытой воды; без BVH `CS_RaytracingResolve`/`CS_ScreenProbes_ActivateRays` шейдят несуществующие попадания. В нашем дереве это `pipeline::left_out` (считается при создании `Pending`, до первого перевода; закрывает `make::ready/early/now` и попадает в `missing()` для диагностики): `VICTORY_WATER_LIGHT=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_ACTIVATE_RAYS=1` возвращают. Ведущее 32-lane хранится в `victory-gpu::host::host_max_wave()` (своя проба `WaveLaneCountMax`), `victory-shader` не тронут. Два unit-теста на решение.
+  **Подтверждено прогоном r10-run1:** в `err.log` три строки «a pipeline is left out for the whole run» — RT resolve `7f05ddab771799a9`, activate rays `39f0e9aeb156a61c`, вода `5dc3b25986622949`; в r10-run2/Run3 — второй водный `6f225b641c5b0708`. Побочно видны и «host pipeline refused 0x80070057» для части wave64-CS (2da4beb3, 02384a6, 6b82bc7d) — это отказ D3D12 на PSO, не наш скип; лечится только wave32-понижением (отдельный раунд).
+- **PR #3476 (view-heap clamp):** ядро уже в дереве (`set_view_heap_limit`, `probe_view_limit`, `translation_fingerprint` с лимитом; линия `fix/nvidia-view-heap-cap`/`fix/amd-view-heap-clamp`), прогон подтвердил: «host view heaps hold 1000000 views; view indices are clamped to the null slot». Из PR взята его host-часть — проба лимита **при создании устройства** (`probe_view_limit_on(&device)`), чтобы ни одна трансляция/ключ кэша не увидели лимит=0 (`d7391d7`). Переименования в victory-shader не переносились (ломают кэш, выгоды нет).
+- **PR #3465 (NVIDIA AV):** не портирован — это **одна строка в тесте** `victory-shader/src/emit/memory_tests.rs`, которого в нашем дереве нет, а любая правка `.rs` под `victory-shader/src` меняет `VICTORY_SHADER_SOURCE_HASH` (build.rs хэширует всё) и убивает кэш. Production-кода PR не меняет.
+- **PR #3378 (очередь пайплайнов):** не портирован — архитектурно другая очередь (`queued/now/first/taken` + 2 очереди + `shown.rs`/`feeds.rs`, ~1 050 строк по 9 файлам), с нашим `make.rs` (один `queue_state: AtomicU8`, один `QUEUE`) чисто не совместим; кандидат отдельного раунда вместе с #3396/#3419.
+- Полный разбор решений: `audit\round10\r10-pr-decisions.md`, диффы — `audit\round10\raw\prs\`.
+
+### 33.4. Шаг 2 — AMBIENT_SPECULAR и native 1440p
+
+- **`VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`** (`71d3293`, порт субагентом): `Role::Miss` (`CS_RayMiss_<8hex>_`, не `_Volumetrics` и не ScreenProbe), проход `reflect_light` (HLSL) сразу после miss-программы и до `CS_ResolveScreenSpace`: оценка света вдоль отражённого направления из тех же cells/points; `words[6/7] = depth_size` (картинка отражений половинная), fallback-сканы мест бинда (обычное место (1,104)/(0,1000), затем UAV 2D f26 и depth-like 32-bit ~2× размера, stencil-плоскости отбраковываются, `placed_texture` для placed-записей), `VICTORY_AMBIENT_SPECULAR_ALPHA=1` — alpha слой; `on()` = (AMBIENT задан ИЛИ SPECULAR задан) И builder off; info-строка раз в 10 с. `VICTORY_AMBIENT_ONCE` не переносили (раскладка cells осталась `2*CELLS+1`, без SHARES). Тесты: `specular_settings`, miss-имена в `roles_by_name`, `the_passes_build` реально компилирует новый проход (0,60 с на D3D12).
+  **Прогон r10-run1:** 32 info-строки; последняя — «45 frames, 62 dispatches of CS_RayMiss followed (surfaces: opaque), … 124 of water or the alpha layer and 0 before a frame's light was kept» → layer определяется верно (opaque), water/alpha честно пропускаются. Полной проверки «красиво/нет» нет: в кадрах вода местами тёмная с пурпурными полосами (`r10-run1\shot-187`), а сцена пляжа пересвечена в белое (`shot-248`) — это кандидат на тюнинг (`share 0.6, sky 0.25`, `AMBIENT 0.6/AIR 1.2`), а не доказанный дефект порта.
+- **`VICTORY_NATIVE_1440P`** (`3b8c017`): четыре поля титула, каждое сверено побайтно: SDR display mode `+0x615c100` (3840×2160@60 → 2560×1440), Settings viewport load `+0x58048d4` (переадресован на SDR mode), temporal scale `+0x28f1e7e` (2/3 → 1.0), output 2560×1440 через наш `OUTPUT`; pool-check перепрыгнут. Скан-аут резервация `+0x247ad4a` (64 MB) **оставлена** — наш pool-check всё равно перепрыгнут; экономия ~34 MB — follow-up, нужен `victory-formats` размер текстуры.
+  Сверка с образом: **BLAKE3 образа = b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93 — ровно retail build, который называет NVIDIA** (SHA-256 файла e95020b2… — другая величина, это и было «расхождение»); PE-разбор `audit\round10\pecheck.py` подтвердил stock-байты на всех их RVA и на всех наших старых сайтах. Во всех трёх прогонах лог: «resolution: patched … Done» для 5 сайтов (0x224352b, 0x247af25, 0x615c100, 0x58048d4, 0x28f1e78).
+
+### 33.5. Шаг 3 — DLSS: read-only аудит
+
+Отчёт `C:\GTA6_Port\audit\dlss-prep.md` (206 строк). Кратко: нужны Streamline SDK **v2.14.16** + 8 DLL (`sl.interposer`, `sl.common`, `sl.dlss`, `sl.dlss_g`, `sl.reflex`, `sl.pcl`, `nvngx_dlss`, `nvngx_dlssg`), качаются пользователем (в git не кладём; лицензии рядом); перехват — подмена **экспортов IAT** `amd_fidelityfx_loader_xbox.dll` (`ffxCreateContext/ffxDestroyContext/ffxDispatch/ffxQuery`), DLSS-ветка в `streamline::upscale()`, `slEvaluateFeature` пишется в наш host-список; **FG на 3060 Ti недоступен** (RTX 40+), только SR. У нас нет трёх кусков: патча рендерера 7 (FidelityFX-путь), перехвата `ffxDispatch`, модуля Streamline; подробный 8-шаговый план следующего раунда — в отчёте. Ожидание по FPS — единицы процентов (кадр ~200 мс при GPU ~33 мс), ценность — качество апскейла; VRAM: пик уже 7,1–7,5 GB, запас < 1 GB.
+
+### 33.6. Шаг 4 — сборка и три прогона в 2K
+
+`cargo build --release -p victory` = 46 с, `target\release\victory.exe` 9 301 504 Б (SHA-256 47755A9F…; после прогона №3 восстановлен из `audit\round10\victory-release-r10.exe`). Для прогона №3 собран диажный профиль: `cargo build --profile diag -p victory --features diagnostics` (11 129 344 Б, DRED доступен только в diagnostics).
+
+Харнесс: anti-AFK теперь **поворот камеры `L` 120 мс каждые 40 с** (правый стик, gameinput.rs:134-135) + `W` 240 мс каждые 120 с (продвижение маршрута). Новые дефолты: `AMBIENT=0.8`, `AMBIENT_AIR=1.5`, `AMBIENT_SPECULAR=1`, `NATIVE_1440P=1` (перекрывает `FORCE_1080P`), `FPS_COUNTER=all`, `TILES_SMALL=512`; снапшоты `audit\round10\harness-launch-game-r10.ps1`, `harness-run-road-r10.ps1`.
+
+| прогон | флаги | с | worldAt | world n | world median | p90 | max | последний кадр | VRAM peak | device loss / ERROR |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `road\r10-run1` | specular=1, native1440p | 420 | 88 | 179 | 216,2 | 405,7 | 4 087,7 | 6 fps / 166,2 мс / 2625 draws | 7 461 | 0 / 0 |
+| `road\r10-run2` | control: specular=0, native1440p | 240 | 88 | 53 | 182,6 | 509,1 | 2 963,6 | 6 fps / 171,5 мс / 1676 draws | 7 152 | 0 / 0 |
+| `road\r10-run3` | RT diag: `BVH_BUILDER=1 BVH_QUARANTINE=1 DRED=1`, ambient/specular=0, **diag-бинарник** | 240 | — | — | — | — | — | до мира не дошёл (6 шотов меню) | 3 393 | 0 / 0 (CPU AV) |
+
+- **Run 1** дошёл до лодочной/островной сцены (shot-187 — лодка и вода, shot-310 — палуба с персонажами, shot-403 — финал), финальная фаза 6 fps / 166 мс. Плиты на воде **не выводятся однозначно**: вода тёмная с пурпурными полосами, часть кадра пересвечена (см. 33.4).
+- **Run 2 (контроль)** — та же сцена-окрестность, specular-строк 0; сравнение 88–240 с: run1 213,3 мс / 1 449 draws против run2 182,6 мс / 1 117 draws; в пересчёте на draw 0,147 против 0,163 мс — **измеримой цены SPECULAR не видно**, разброс сцены больше эффекта (как и в §32.4). Вывод: флаг оставляем включённым по умолчанию в харнессе, но «доказанным» не называем.
+- **Run 3 (RT-диагностика):** RT-билдер **до мира не доходит**. Титул падает в загрузке на ~125 с: `first-chance/unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x0: nothing mapped there)`, далее BacktraceBreakpad/minidump (HTTP заблокирован). Device removal/DRED-событий нет (это CPU-AV, не потеря устройства), VRAM peak 3 393 MB, builder-диспетчей в логе нет. **RT остаётся выключенным по умолчанию**; для разбора нужен отдельный раунд (адрес 0x23cf683, QUARANTINE-путь HLE).
+- Во всех прогонах `0 ERROR`, `0 device loss`; медленные кадры 2–4 с — это собственные паузы титула (preparing/копии/подгрузка), не флаги (видны и в контроле run2).
+
+### 33.7. Тесты и сборка
+
+- После Шага 1 (a+b): полный `cargo test --workspace -- --test-threads=1` упал **только** на известном warp-флейке §23.3 (`indirect::tests::warp_budget_saturates…`); ретрай флейка — снова FAIL (ожидаемо), финальный гейт с `--skip` этого теста: **667 passed / 0 failed / 17 ignored** (+2 новых теста Шага 1).
+- После Шага 2 (SPECULAR субагентом): **669 passed / 0 failed / 17 ignored** (`audit\round10\test-step2-specular.log`), `the_passes_build` компилирует новый REFLECT-проход.
+- `cargo check --workspace` — 0 после каждого шага. Финальное дерево побайтно совпадает с протестированным (`git diff 77e17e0 HEAD` пуст после починки сплита коммитов).
+- Логи: `audit\round10\test-step1a.log`, `test-step1a-skip.log`, `test-step1b.log`, `test-step2-specular.log`, `build-release.log`, `build-diag.log`.
+
+### 33.8. Артефакты
+
+- Прогоны: `C:\GTA6_Port\road\r10-run{1,2,3}\` (captions/vram/err/out/shot/env/version/keys/watch).
+- Анализ: `audit\round10\r10-analyze.ps1`, `analyze-run{1,2,3}.log`, консоли `run{1,2,3}-console.log`.
+- Порты/решения: `audit\round10\r10-pr-decisions.md`, `raw\prs\` (метаданные и диффы #3476/#3465/#3378), `raw\ambient-specular.diff`, `pecheck.py`, `victory-release-r10.exe`.
+- DLSS: `audit\dlss-prep.md`. Харнесс: `audit\round10\harness-*-r10.ps1`.
+
+### 33.9. Ветка и следующий раунд
+
+- Ветка **`feat-r10-water-heapcap-and-1440p`** запушена в `myfork` (`4EKUSHKAq/victory-fork-3060ti`); локально = remote; `victory-shader` и кэш шейдеров целы.
+- Round 11 (по приоритету): (1) визуальный тюнинг `AMBIENT_SPECULAR` (0.6/0.25, затем `AMBIENT_SPECULAR_ALPHA=1` на воде) и `AMBIENT 0.8→0.6` — убрать пересвет/пурпур; (2) `native_1440p` скан-аут резервация (−34 MB) через `victory-formats` размер текстуры; (3) DLSS SR по плану `audit\dlss-prep.md` (без правок victory-shader) — сначала `ffxDispatch`-перехват и `sl.interposer`, FG не трогать; (4) разбор RT-краша `0x23cf683` (BVH+QUARANTINE, diag-бинарник); (5) сцен-матчевый A/B-маршрут (фиксированная камера/boat-сцена) для specular/ASYNC/EXACT; (6) кандидаты PR #3378/#3396/#3419 и wave64-понижение (3 refused CS).

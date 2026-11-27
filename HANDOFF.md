@@ -487,3 +487,22 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 ### 35.6. Артефакты
 
 `audit\round12\`: `check-stepA.log`, `test-stepA.log`, `check-b1.log`, `test-b1.log`, `build-release.log`, `r12-analyze.ps1`, `harness-*-r12.ps1`, `ui1080-console.log`, `ui1440-console.log`. Скриншоты сравнения UI: `C:\GTA6_Port\road\r12-ui1080\`, `C:\GTA6_Port\road\r12-ui1440\`. Документ-источник разбора: `C:\Users\4EKUSHKA\Downloads\plan-rendering-parallel-discord.md`.
+
+### 35.7. B2–B4 (продолжение) — изоляция провала DELTA_LAND, батчевая запись, закрепление дефолтов
+
+**Изолированный A/B (без `AMBIENT_SPECULAR_ALPHA`), сцена «Люси сажают в машину копов», 243–299 с:**
+- `r12-run1` (`DELTA_LAND=0`): world median **161,4 мс**, p90 386,7, max 1049,1; copy-back 18–108 мс;
+- `r12-delta1` (`DELTA_LAND=1`, старый код): median **1251,4 мс**, p90 2451,1, copy-back до **1751 мс**;
+- `r12-run2` (`DELTA_LAND=1` + `ALPHA=1`): median 1167,1 — как delta1, значит **`AMBIENT_SPECULAR_ALPHA` ни при чём**, провал даёт именно `DELTA_LAND` (мелкие `write_mapped` в watch-память на каждом кадре шторма).
+
+**B3 (частично):**
+- `crates/victory-gpu/src/shadow.rs`: батчевый delta-land — близкие run'ы (разрыв ≤ **512 Б**) склеиваются в один `write_mapped`, при > **64** run'ов — один общий write всего участка (плюс тест `nearby_delta_runs_are_written_as_one`).
+- Замер нового кода: max copy-back упал **1751 → 134 мс** (провал relay устранён), но world median 225,3 мс против 161,4 у `DELTA_LAND=0` → **регрессия по кадрам осталась**, поэтому `DELTA_LAND` оставлен **выключенным по умолчанию** (включать только после доработки).
+- `BAKE_TEXTURES_MS=25` закреплён по умолчанию в `run-road.ps1` (в `launch-game.ps1` такой ручки нет — там дефолт кода).
+- Масштабирование бюджетов 8 ГБ (101Leafy #26: RT-резерв 3072 MB, spares 4 ГиБ) **не перенесено** — требует правок `resource.rs`/`pool.rs`, следующий сеанс.
+
+**B2 (lit-фолбэк shadow-mask) — не реализован.** Для него нужен `diag`-билд с `VICTORY_CAPTURE` (feature `diagnostics`; отдельный ключ кэша шейдеров → прогрев) и дамп классов `R32_UINT`-таблиц; заготовка логирования уже в `capture.rs` (Шаг A). Это первый шаг следующего сеанса.
+
+**B4 (закреплено):** свет по умолчанию `AMBIENT=0.5`, `AMBIENT_SPECULAR=0.3,0.15` (в обоих скриптах), `NATIVE_1440P=1` + `-RenderScale 0.5` (нормальный 2K-UI: «ВЫБОР УЧЁТНОЙ ЗАПИСИ» 246×30 px против 355×38 при 1080p), `FPS_COUNTER=all`, `TILES_SMALL=512`, `VICTORY_DLSS=0`. Региональные метрики `r12-analyze.ps1` по кадрам B4 ещё не снимались (следующий сеанс вместе с B2 и `RT_SHADOW=lit`).
+
+**Факты для следующего шага:** провал `r12-run2` — это не диск/pagefile (active time 1 %, avg 0.9 мс, pagefile 0.99/5.5 ГБ): узкое место — GPU 0,9–1,3 с + relay copy-back при полной VRAM (5,86/8,19 ГБ, host-копии 1018 MB). Приоритеты: бюджеты 8 ГБ (#26) и перекрытие copy-back с GPU, затем B2.

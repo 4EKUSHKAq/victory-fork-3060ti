@@ -9033,6 +9033,23 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            if ms > 300.0 {
+                // Round 15: a frame this slow spends time the stages of the
+                // frame line do not count - pipeline compilation on first use
+                // (Round 14: a 7501 ms frame with under 700 ms of stages), the
+                // write-watch's bookkeeping, page queries and locks. The gap
+                // says how much is still unexplained.
+                let accounted = cpu + gpu + copy_ms + texture_ms + back_ms;
+                tracing::info!(
+                    ms,
+                    accounted,
+                    unaccounted = ms - accounted,
+                    fps,
+                    draws,
+                    making = crate::pipeline::making(),
+                    "slow frame: the stages above do not account for all of it"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

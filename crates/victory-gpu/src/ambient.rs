@@ -133,7 +133,7 @@ fn set() -> Set {
 /// Whether a stand-in is on (for the diffuse light or for reflections):
 /// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_whole()
 }
 
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found

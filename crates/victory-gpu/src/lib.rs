@@ -55,6 +55,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land;
 mod launch;
 pub mod list;
 pub mod object;
@@ -63,6 +65,8 @@ pub mod pipeline;
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;

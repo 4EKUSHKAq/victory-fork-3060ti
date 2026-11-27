@@ -4437,6 +4437,138 @@ impl Shadow {
     }
 }
 
+/// Whether what shaders wrote goes into title memory by the run, and not the
+/// whole stretch from the first changed byte to the last: on by default
+/// (`VICTORY_EXACT_BACK=0` turns it off). [`crate::land::on`] asks for it
+/// before its own, safer landing is used, as in the tree this came from; this
+/// tree writes by the run only with `VICTORY_LAND=1`/`VICTORY_DELTA_LAND=1`
+/// and its own [`delta_land`] (which asks the same, from our side).
+pub(crate) fn exact_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_BACK").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: pieces put back by a landing, the writes
+/// they took, the bytes written, and the pieces whose runs were joined over
+/// bytes that had not changed.
+///
+/// Port of `Shadow::PUT` from `trustno1-coder/VIctory-NVIDIA`
+/// (GPL-3.0-or-later), commit `590af7c`; this tree has no `put_changed` yet,
+/// so the counter is kept by [`crate::land::piece`] alone.
+pub(crate) static PUT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+impl Shadow {
+    /// [`Shadow::card_merge_relay`] of several pieces, each within one
+    /// 64 KiB block of title memory: from and to (offsets in the copy), and
+    /// where the fetched bytes are. On any thread: several may land pieces
+    /// of one copy, no two the same bytes. Returns the bytes put into title
+    /// memory.
+    ///
+    /// What is left out is as there, asked once for all of them: the notes
+    /// of bytes that went up (or are to go up) behind the fetch only move
+    /// from `dirty` to `sent`, with a later number.
+    ///
+    /// Port of `Shadow::land_card` from `trustno1-coder/VIctory-NVIDIA`
+    /// (GPL-3.0-or-later), commit `590af7c`, brought over at their `main`
+    /// (`d12eb1b`); adapted to this tree: the lock against the title's bytes
+    /// going into the copy is this tree's `before` lock (not a `merging`
+    /// `RwLock` the refresh takes), the beside-the-guards path is gone (a
+    /// piece is landed by [`crate::land::piece`] through the title's own
+    /// address), and `note_landing` notes nothing here (this tree's refresh
+    /// has no landed-page bits to take).
+    ///
+    /// # Safety
+    /// The third of each piece is the address of its bytes, which stay as
+    /// they are during the call.
+    pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        let waiting = std::time::Instant::now();
+        // The title's bytes going into the CPU's side (`merge_under_writes`,
+        // `relay_merge`) hold this lock, so no byte of them is half done
+        // here, as in `card_merge_relay`.
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        crate::land::spent(crate::land::stat::LOCK, waiting);
+        let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            dirty
+                .iter()
+                .copied()
+                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < to && b > from)
+                .collect()
+        };
+        let mut put = 0;
+        for &(lo, hi, now) in pieces {
+            if lo >= hi || hi > self.len as usize {
+                continue;
+            }
+            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            // SAFETY: inside the mapping (checked above), in a range
+            // declared and not done with, which no refresh writes; the
+            // title's bytes are kept out by the lock held here; the card's
+            // bytes of the fetch stay as they are during the call.
+            let merged =
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+            self.walls_merged(hi - lo, merged as usize);
+            if merged > 0 {
+                self.note_landing(lo, hi);
+            }
+            put += merged;
+        }
+        put
+    }
+
+    /// [`Shadow::relay_merge`] of a piece `[at, at + n)` (within one 64 KiB
+    /// block of title memory) of a copy in the PC's memory; on any thread,
+    /// as [`Shadow::land_card`]. The copy is read once and never written.
+    /// Returns the bytes put into title memory.
+    ///
+    /// Port of `Shadow::land_back` from `trustno1-coder/VIctory-NVIDIA`
+    /// (GPL-3.0-or-later), commit `590af7c`, brought over at their `main`
+    /// (`d12eb1b`); adapted to this tree: the snapshot's lock is this tree's
+    /// `before` lock (as `relay_merge` takes it), and the quiet/own-view
+    /// write-backs and the merge-race re-read of `relay_merge` are not done:
+    /// [`crate::land::piece`] reads each dword of title memory just before it
+    /// stores it, which is what they were for.
+    pub(crate) fn land_back(&self, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        let waiting = std::time::Instant::now();
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        crate::land::spent(crate::land::stat::LOCK, waiting);
+        // The snapshot's memory stays where it is until the range is done
+        // with (`copy_back_done`), which comes after this.
+        let Some(before) = snapshot.as_mut() else {
+            return 0;
+        };
+        // SAFETY: inside the copy's mapping (checked above), which only the
+        // card writes there, and inside the snapshot's allocation, which
+        // holds the copy's length (`writing`): these offsets are in a range
+        // declared and not done with, whose bytes it holds, and the lock
+        // keeps out what else writes them. Title memory that is not there is
+        // looked at again when the next flight that declared the range lands.
+        unsafe {
+            crate::land::piece(self.start as usize + at, self.data.add(at), before.as_mut_ptr().add(at), &[(0, n)], false, notes, self)
+        }
+    }
+
+    /// What shaders wrote in 64 KiB block `block` (of title memory) of this
+    /// copy was put into title memory. This tree's refresh has no
+    /// landed-block bits and no `crate::watch::block_published` to ask
+    /// before taking a block, so the note is kept as a place and nothing is
+    /// written (the next refresh takes the block again, as before the
+    /// landing).
+    fn note_landing(&self, from: usize, to: usize) {
+        let _ = (from, to);
+    }
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -5526,6 +5658,127 @@ mod merge_piece_tests {
                 assert_eq!(out, differs != 0, "len {len} trial {trial}: whether title memory changed");
                 assert_eq!(held2, held, "len {len} trial {trial}: the copy's reference");
                 assert_eq!(title2, title, "len {len} trial {trial}: title memory's bytes");
+            }
+        }
+    }
+}
+
+/// Landings on the thread pool against the one-by-one merges they replace.
+///
+/// Port of `mod land_tests` from `crates/victory-gpu/src/shadow.rs` of
+/// `trustno1-coder/VIctory-NVIDIA` (GPL-3.0-or-later), commit `590af7c`,
+/// brought over at their `main` (`d12eb1b`); adapted to this tree: a title
+/// memory that is a view is made and noted by this tree's `crate::inplace`
+/// calls, a copy's `card.sent` is this tree's plain `Vec`, and the test of
+/// landings beside the title's bytes going in is left out (`merge_under_writes`
+/// and the landed-page notes differ here; see the notes file).
+#[cfg(test)]
+mod land_tests {
+    use super::{Card, PIECE, Shadow};
+    use std::sync::Mutex;
+
+    /// A copy in the card's memory of title memory at `title` (its card side
+    /// is never looked at here), all bytes 0 on the CPU's side.
+    fn copy_of(title: usize, len: usize) -> Option<Shadow> {
+        let (buffer, data) = crate::host::host()?.shared_buffer(len as u64)?;
+        // SAFETY: the mapping, `len` bytes.
+        unsafe { std::ptr::write_bytes(data, 0, len) };
+        let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
+        shadow.card = Some(Card {
+            staging: buffer,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: len as u64,
+        });
+        Some(shadow)
+    }
+
+    /// Memory that stays (`crate::watch` knows its addresses): private, or a
+    /// view noted as the runtime notes the title's.
+    fn memory(len: usize, view: bool) -> usize {
+        use windows_sys::Win32::System::Memory as mem;
+        // SAFETY: plain allocations of our own.
+        unsafe {
+            if !view {
+                return mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            }
+            let section = mem::CreateFileMappingW(-1isize as _, std::ptr::null(), mem::PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            let at = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            crate::inplace::title_memory_section(section as usize, len as u64, true);
+            crate::title_memory_remapped(at, len);
+            crate::inplace::title_memory_view(at, len, section as usize, 0);
+            at
+        }
+    }
+
+    fn random(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 8) as usize
+    }
+
+    /// [`Shadow::land_card`] leaves title memory and the CPU's side as
+    /// [`Shadow::card_merge_relay`] does, with title bytes that went up
+    /// behind the fetch, or have not gone up, left out.
+    #[test]
+    fn pieces_land_as_the_merge_one_by_one_lands_them() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = 3 * PIECE;
+        let mut seed = 0x1234_5678_9abcu64;
+        for view in [false, true] {
+            let (a, b) = (memory(LEN, view), memory(LEN, view));
+            let (Some(one), Some(many)) = (copy_of(a, LEN), copy_of(b, LEN)) else {
+                return; // no host GPU
+            };
+            // SAFETY: the two memories and the two mappings.
+            let bytes = |at: usize| unsafe { std::slice::from_raw_parts_mut(at as *mut u8, LEN) };
+            for round in 0..40u32 {
+                let base: Vec<u8> = (0..LEN).map(|_| random(&mut seed) as u8).collect();
+                let (mut held, mut title, mut now) = (base.clone(), base.clone(), base);
+                let (mut dirty, mut sent) = (Vec::new(), Vec::new());
+                for k in 0..120 {
+                    let at = random(&mut seed) % LEN / 4 * 4;
+                    let n = (random(&mut seed) % 900 / 4 * 4).min(LEN - at);
+                    match k % 4 {
+                        0 | 1 => now[at..at + n].fill(random(&mut seed) as u8),
+                        2 => title[at..at + n].fill(random(&mut seed) as u8),
+                        // Title bytes put into the CPU's side meanwhile.
+                        _ => {
+                            let byte = random(&mut seed) as u8;
+                            held[at..at + n].fill(byte);
+                            title[at..at + n].fill(byte);
+                            if k % 8 == 3 {
+                                dirty.push((at, at + n));
+                            } else {
+                                sent.push((at, at + n, u64::from(round % 3) + (k as u64 / 16)));
+                            }
+                        }
+                    }
+                }
+                let after = 4u64;
+                for (shadow, at) in [(&one, a), (&many, b)] {
+                    crate::watch::writing(at, LEN);
+                    bytes(at).copy_from_slice(&title);
+                    bytes(shadow.data as usize).copy_from_slice(&held);
+                    let card = shadow.card.as_ref().expect("made with one");
+                    *card.dirty.lock().unwrap() = dirty.clone();
+                    *card.sent.lock().unwrap() = sent.clone();
+                }
+                let pieces: Vec<(usize, usize)> = (0..3).map(|p| (p * PIECE + 16, (p + 1) * PIECE - 4)).collect();
+                let mut scratch = Vec::new();
+                for &(lo, hi) in &pieces {
+                    one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch);
+                }
+                let addressed: Vec<(usize, usize, usize)> =
+                    pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
+                let mut notes = crate::land::Notes::default();
+                // SAFETY: the fetched bytes are `now`'s.
+                unsafe { many.land_card(&addressed, after, &mut notes) };
+                notes.flush();
+                assert!(bytes(a) == bytes(b), "title memory, round {round}");
+                assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
             }
         }
     }

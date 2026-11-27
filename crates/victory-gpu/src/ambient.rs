@@ -159,6 +159,39 @@ fn specular() -> Option<Specular> {
     *SET.get_or_init(|| parse_specular(&std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default()))
 }
 
+/// `VICTORY_RT_SHADOW=lit[,<share>]`: a soft lit level added to what the
+/// stand-in's estimate leaves near black (a share of the estimate, 0.35 by
+/// default; a number 0.01-2 instead; `off`/unset: nothing). It does not touch
+/// the title's shadow-mask table: with the RT tracers out of the run that
+/// table is never written and the darkness a room keeps comes from the
+/// estimate's own proportional bound (trustno1-coder/VIctory-NVIDIA #19,
+/// GPL-3.0-or-later), which this cannot raise above zero.
+fn rt_shadow() -> f32 {
+    static SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| parse_rt_shadow(&std::env::var("VICTORY_RT_SHADOW").unwrap_or_default()))
+}
+
+fn parse_rt_shadow(set: &str) -> f32 {
+    let set = set.trim().to_ascii_lowercase();
+    if set.is_empty() || set == "0" || set == "off" {
+        return 0.0;
+    }
+    let mut parts = set.split(',').map(str::trim);
+    let named = parts.next().unwrap_or_default();
+    let share = parts
+        .next()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.01..=2.0).contains(v));
+    match named {
+        "1" | "on" | "lit" => share.unwrap_or(0.35),
+        other => other
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && (0.01..=2.0).contains(v))
+            .unwrap_or(0.0),
+    }
+}
+
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
@@ -194,7 +227,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float lit_floor;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -447,6 +480,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    // VICTORY_RT_SHADOW=lit: a soft lit level for what the title's resolve and
+    // our estimate leave near black. A bound proportional to the estimate
+    // (found >= 0.2 * all below) still goes to zero when the whole room is
+    // dark - the reason indoor faces stay charcoal (trustno1 #19). This adds
+    // a share of the estimate itself, so a dark room is dim, not black.
+    if (lit_floor > 0.0) was = max(was, found * lit_floor);
     light[p] = pack(max(was, found));
 }
 #endif
@@ -683,6 +722,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = rt_shadow().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -729,6 +769,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lit_fallback_parse() {
+        assert_eq!(parse_rt_shadow(""), 0.0);
+        assert_eq!(parse_rt_shadow("0"), 0.0);
+        assert_eq!(parse_rt_shadow("off"), 0.0);
+        assert_eq!(parse_rt_shadow("lit"), 0.35);
+        assert_eq!(parse_rt_shadow("1"), 0.35);
+        assert_eq!(parse_rt_shadow("lit,0.6"), 0.6);
+        assert_eq!(parse_rt_shadow("0.2"), 0.2);
+        assert_eq!(parse_rt_shadow("5"), 0.0, "out of range: nothing");
+        assert_eq!(parse_rt_shadow("nonsense"), 0.0);
+    }
 
     #[test]
     fn settings() {

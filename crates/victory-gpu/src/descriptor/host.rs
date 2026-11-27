@@ -1943,7 +1943,21 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
-            // this slot.
+            // this slot. A slot made again from a view of the resource it
+            // already holds keeps it (most buffer views of a frame are on a
+            // few host copies): nothing to retire, and the retired list's lock
+            // (one for every thread) is left alone. From
+            // Belobug/VIctory-Belobug-AMD #622's sibling change in Marvisak
+            // #3522 (`HostHeap::keep`, GPL-3.0-or-later).
+            let same = match (&resource, &*slot) {
+                (Some(new), Some(old)) => {
+                    windows::core::Interface::as_raw(new) == windows::core::Interface::as_raw(old)
+                }
+                _ => false,
+            };
+            if same {
+                return;
+            }
             if let Some(old) = std::mem::replace(slot, resource) {
                 crate::host::retire(old);
             }

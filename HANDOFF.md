@@ -686,7 +686,7 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 - **Харнесс**: `audit\round16\run-nvidia.ps1` — та же механика, что `run-road.ps1` (тихо: без `HWND_TOPMOST`, без физ. ввода, окно 1280×720 `HWND_NOTOPMOST`+`SWP_NOACTIVATE`, вход только `VICTORY_KEYS`). Профиль — `scripts\play-foxhound.ps1` с `-Dlss off|quality -Res 1080to1440` и **без frame generation** (`-NoFrameGenReady`: на 8 ГБ не отдаём 14 % бюджета под недоступный FG). DLSS проверен заранее: `upscaler-check --device` — SR работает (SL 2.14.16, ngx 310.9.16), FG «not supported on this GPU».
 - **Сцена**: `VICTORY_KEYS`-маршрут (Enter-пульсы) проходит пролог и приводит на **ту же лодочную миссию** («Следуйте за самолётом»), что и ручной прогон §38.4; окно геймплея — 340–420 с. Образ опознан их патчем: `victory-image-b99f876b74d4a77f.dll` (тот же дамп v1.0.2.1).
 
-### 39.3. Прогоны (по 420 с, окно геймплея 340–420 с)
+### 39.3. Прогоны (по 420 с; окно геймплея: A1 389–420 с, A2/B 340–420 с)
 
 | | A1 холодный | A2 тёплый | B DLSS quality |
 |---|---|---|---|

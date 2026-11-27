@@ -2431,9 +2431,9 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 - Предложение: расширить AGENTS п.8 с 5 до **7** репозиториев (`xcl` — только идеи, `XSEmu` — третья линия, GPL-3-файлы — с provenance), чтобы разрыв не повторился.
 - Код не менялся; следующий шаг — по команде пользователя: port P0-1/P0-2/P0-3 (copy-back wait, saturating_sub, tiles A/B) отдельными коммитами с `cargo check/test` и парным A/B.
 
-## §32. Раунд 9 боевой — ветка `feat-r9-async-copyback-and-water`: Step 0 (AGENTS 7 репо, нативные 2K, tiles 512), P0/P1 (`saturating_sub`, `ASYNC_COPY_BACK`, `EXACT_TEXBACK`, `DELTA_LAND`+tid), 5 портов из апстримов, release и 6 A/B-прогонов; **`DELTA_LAND` — измеренная регрессия**, остальные флаги opt-in; 10 коммитов, 663 passed
+## §32. Раунд 9 боевой — ветка `feat-r9-async-copyback-and-water`: Step 0 (AGENTS 7 репо, нативные 2K, tiles 512), P0/P1 (`saturating_sub`, `ASYNC_COPY_BACK`, `EXACT_TEXBACK`, `DELTA_LAND`+tid), 6 портов из апстримов, release и 6 A/B-прогонов + smoke; **`DELTA_LAND` — измеренная регрессия**, остальные флаги opt-in; 12 коммитов, 665 passed
 
-Ветка от `97ba4c0` (Round 9 research). `HEAD` на момент отчёта — см. `git log`; код менялся **только в `crates/victory-gpu` + `crates/victory-loader`**, `victory-shader` **не тронут** (14 файлов, ни одного в `victory-shader`), поэтому кэш `shaders-r8-group2` цел (76 973+ файла не перезаписывались). Коммиты: `743c03e` (Step 0), `ce8f626` (saturating_sub), `ae8c3c5` (`ASYNC_COPY_BACK`), `e9b3444` (`DELTA_LAND` + tid), `6320e4f` (`EXACT_TEXBACK`), `7d81ce0` (Belobug #414), `b86edd7` (Belobug #449), `aa504a1` (fxceless #1380), `633cfb9` (VItoriaBr #72), `5e1069e` (fxceless #1392).
+Ветка от `97ba4c0` (Round 9 research). `HEAD` на момент отчёта — см. `git log`; код менялся **только в `crates/victory-gpu` + `crates/victory-loader`**, `victory-shader` **не тронут** (14 файлов, ни одного в `victory-shader`), поэтому кэш `shaders-r8-group2` цел (76 973+ файла не перезаписывались). Коммиты: `743c03e` (Step 0), `ce8f626` (saturating_sub), `ae8c3c5` (`ASYNC_COPY_BACK`), `e9b3444` (`DELTA_LAND` + tid), `6320e4f` (`EXACT_TEXBACK`), `7d81ce0` (Belobug #414), `b86edd7` (Belobug #449), `aa504a1` (fxceless #1380), `633cfb9` (VItoriaBr #72), `5e1069e` (fxceless #1392), `f91b8ae` (Belobug #396).
 
 ### 32.1. Шаг 0 — правило 7 звёзд, нативные 2K, 512 МБ тайлов
 
@@ -2452,11 +2452,11 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 - **`VICTORY_DELTA_LAND=1` (`e9b3444`):** `relay_merge`/`card_merge_relay` пишут только изменившиеся run'ы вместо stretch от первого до последнего отличия. **Измеренная регрессия:** прогон `ab2` (все три флага) дал **~1 fps**, landing 526 мс/строку против 73–119 у остальных, top-thread 93 %. Причина: `delta_write` делает отдельный `write_mapped` на каждый run (десятки kernel-вызовов) вместо одного stretch; флаг оставлен **off**, переделку (батч по 64-КиБ piece или один merged write) — в следующий раунд.
 - **tid потока-победителя (`e9b3444`, `stats.rs`):** load-строка теперь пишет `its busiest thread N % of one (victory-submit tid 14356)`; зарегистрированы `victory-submit/relay/heap/late-wait/wide/stats`. В `ab1` победитель — `victory-submit` (13/37 проб), затем `victory-heap` (4) и неназванные tid'ы; это подтверждает вывод coolfox-perf про submit-поток.
 - **Порты (каждый отдельным коммитом, `cargo check`=0 после каждого):** Belobug **#414** `FRAME.load` до swap (`7d81ce0`); Belobug **#449** legal-state с обеих сторон host-barrier (`b86edd7`); fxceless **#1380** clzero на guarded/uncommitted линии через runtime-хендлеры, 151 строка (`aa504a1`); VItoriaBr **#72** placed-UAV aliases: мирроринг в host-heap, reuse target по адресу, alias в placed SRV (`633cfb9`, тесты адаптированы: `Held` derives, `alias_of(...).map(|h| h.get())`, `make(...).is_some()`); fxceless **#1392** partly-mapped never-filled текстура падает в `copy_mapped` вместо нулей (`5e1069e`, 3-way конфликт разрешён вручную, тест зелёный).
-- **Belobug #396 НЕ портирован:** форк Belobug разошёлся с нашим деревом в `descriptor/host.rs`/`draw.rs` — из 8 хунков применились 2, остальные отвергнуты; частичный патч откачен, нужен отдельный адаптационный шаг (tuple `checked` → `TextureRecheck` + `changed_in_place`).
+- **Belobug #396 портирован вручную (`f91b8ae`):** `Waiting.checked` — tuple `(u64,u64,u64,u8,u64)` → структура **`TextureRecheck`** (+`changed_in_place`), `recheck` принимает её целиком, `checked(index, write)` сверяет `write`; `HostHeap::texture_slot_recheck/checked` — новые сигнатуры; в `draw.rs` добавлены `next_texture_recheck()` (0→12, 1→40, 2→120, 3→400 кадров; текстура, однажды изменившаяся без уведомления, держит последний интервал 400 после конца начальных проверок), `changed_in_place` и `schedule_recheck`; тесты `only_previously_changed_textures_keep_the_final_recheck_interval` и `a_descriptor_rewrite_clears_periodic_texture_rechecks` зелёные. Это корректность незамеченных изменений текстур (не скорость); smoke 180 с после порта — чистый.
 
 ### 32.4. Шаг 3 — release и A/B-прогоны (нативные 2K, окно 1280×720 topmost, anti-AFK W/40 с, FPS=all)
 
-`cargo build --release -p victory` = 35,27 с, `victory.exe` **9 285 120 Б**. Шесть прогонов:
+`cargo build --release -p victory` = 35,27 с, `victory.exe` **9 285 120 Б** (до порта #396; после него release пересобран за 31,83 с → **9 286 656 Б**). Шесть прогонов:
 
 | прогон | флаги | с | мир с | world n | world ms | fps | 500–1500 | 1500–3000 | top % | VRAM peak | ERROR |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -2470,6 +2470,7 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 - **Device loss/ERROR: 0 во всех шести прогонах**, VRAM peak 7 124–7 504 МиБ (< 8 192).
 - Сцена между прогонами расходится сильно (world median draws 1 019–2 533, worldAt 58–89 с), поэтому **одиночная пара «флаги vs база» не доказывает выигрыш**: `ab3` заметно быстрее `ab4`, но `ab6` медленнее `ab5`; базовая дисперсия world-медианы 210–272 мс. Вывод: для решения нужен сцен-матчевый маршрут (фиксированная камера/сцена), а не свободный W-маршрут.
 - **Визуально:** нативные 2K подтверждены (fpsbox читаемый, интерфейс не раздут; `ab1\shot-233` — пляж/лодки, артефактов от флагов не видно); `ab3\shot-236` — тёмная сцена с чёрным силуэтом и белыми точками (известная RT/свет-проблема, не привязана к флагу; встречается и в базовых прогонах). Плиты на воде в этих прогонах не выведены на сцену — отдельный boat-маршрут всё ещё нужен.
+- **Smoke после порта #396** (`road\r9-bel396-smoke`, 180 с, база): world 200,5 мс медиана / p90 290,5, 11/11 шотов, 0 ERROR, 0 device loss, VRAM peak 7 559 МиБ, top-thread median 57 %, процесс завершился чисто (`exited cleanly`); в логе 206 срабатываний «changed after its upload with nothing to tell of it» — это и есть текстуры, которые теперь досматриваются на 400-м интервале.
 
 ### 32.5. Решение по дефолтам
 
@@ -2478,17 +2479,17 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 ### 32.6. Тесты и сборка
 
 - `cargo check --workspace` = 0 после каждого шага/порта.
-- Полный `cargo test --workspace -- --test-threads=1` зелёный, кроме известного warp-флейка §23.3 (`indirect::tests::warp_budget_saturates...`): он **воспроизводится и на чистом HEAD** (3/3, затем 4 попытки) — не связан с правками; по политике §23.3 финальный прогон с `--skip` этого теста: **663 passed / 0 failed / 17 ignored** (+5 тестов к Round 8: big compare, delta runs, два vb72, fx1392). Логи: `audit\round9\r9-step1a-test*.log`, `r9-step1b-test*.log`, `r9-step2-ports-test.log`.
-- Новые тесты: `a_big_compare_finds_changes_in_its_first_slice`, `delta_landing_runs_are_the_stretches_that_differ`, `placed_unordered_texture_view_mirrors_and_aliases_to_shader_view`, `cached_placed_uav_is_visible_after_releasing_a_temporary_target`, `no_wait_unlocked_falls_back_for_never_filled_partly_mapped_texture`.
+- Полный `cargo test --workspace -- --test-threads=1` зелёный, кроме известного warp-флейка §23.3 (`indirect::tests::warp_budget_saturates...`): он **воспроизводится и на чистом HEAD** (3/3, затем 4 попытки) — не связан с правками; по политике §23.3 финальные прогоны с `--skip` этого теста: **663 passed / 0 failed / 17 ignored** после портов и **665 passed / 0 failed / 17 ignored** после #396 (+7 тестов к Round 8). Логи: `audit\round9\r9-step1a-test*.log`, `r9-step1b-test*.log`, `r9-step2-ports-test.log`, `r9-bel396-test.log`.
+- Новые тесты: `a_big_compare_finds_changes_in_its_first_slice`, `delta_landing_runs_are_the_stretches_that_differ`, `placed_unordered_texture_view_mirrors_and_aliases_to_shader_view`, `cached_placed_uav_is_visible_after_releasing_a_temporary_target`, `no_wait_unlocked_falls_back_for_never_filled_partly_mapped_texture`, `only_previously_changed_textures_keep_the_final_recheck_interval`, `a_descriptor_rewrite_clears_periodic_texture_rechecks`.
 
 ### 32.7. Артефакты
 
-- Прогоны: `C:\GTA6_Port\road\r9-ab{1..6}\` (captions/vram/err/shot/env/version).
+- Прогоны: `C:\GTA6_Port\road\r9-ab{1..6}\` и `road\r9-bel396-smoke\` (captions/vram/err/shot/env/version).
 - Сводка: `audit\round9\ab-final-table.txt`, `ab1-summary.txt`, `ab2-summary.txt`; анализатор `audit\round9\ab-analyze.ps1`.
 - Порты: `audit\round9\raw\ports\{fx1380,fx1392,vb72,bel414,bel449,bel396}.diff`; снапшоты харнесса `audit\round9\harness-*-r9*.ps1`.
-- Тесты/сборка: `audit\round9\r9-step1a-test*.log`, `r9-step1b-test*.log`, `r9-step2-ports-test.log`; release — `target\release\victory.exe`.
+- Тесты/сборка: `audit\round9\r9-step1a-test*.log`, `r9-step1b-test*.log`, `r9-step2-ports-test.log`, `r9-bel396-test.log`; release — `target\release\victory.exe`.
 
 ### 32.8. Ветка и следующий раунд
 
 - Ветка **`feat-r9-async-copyback-and-water`** запушена в `myfork` (`4EKUSHKAq/victory-fork-3060ti`) после этого коммита; режим — Series X.
-- Round 10: (1) `DELTA_LAND` переделать (батч изменённых run'ов в один `write_mapped`, замер landing); (2) `bel396` адаптировать отдельно; (3) сцен-матчевый A/B-маршрут (фиксированная камера, boat-сцена) для решения по `ASYNC_COPY_BACK`/`EXACT_TEXBACK`; (4) если флаги не дают стабильного выигрыша — вернуться к wave64 (3 refused CS) и VRAM-политике 75/85/92 % из xcl.
+- Round 10: (1) `DELTA_LAND` переделать (батч изменённых run'ов в один `write_mapped`, замер landing); (2) сцен-матчевый A/B-маршрут (фиксированная камера, boat-сцена) для решения по `ASYNC_COPY_BACK`/`EXACT_TEXBACK`; (3) если флаги не дают стабильного выигрыша — вернуться к wave64 (3 refused CS) и VRAM-политике 75/85/92 % из xcl.

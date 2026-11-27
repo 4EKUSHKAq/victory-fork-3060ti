@@ -2242,3 +2242,86 @@ bq1/bq2 (по заданию) против bq3/bq4 (бюджет по умолч
 5. **0039 floor 64 КиБ** — env-only A/B (`VICTORY_CARD_BUFFERS_MIN_KB=64`) на 2×300 с; ReBAR-копии (256–512 МБ) — только после, осторожно на 8 ГБ (peak 7 754–7 837 МиБ).
 6. Сцена-матчевый A/B нового билда против `8eb61a6` (одна и та же лодочная сцена) — снять вопрос по GPU wait/CPU-паку.
 7. Телеметрия под Series S (fpsbox в plane 0 до композита); режим — **Series X**.
+
+## §30. Раунд 8: ветка `feat-r8-1080p-and-kelvaroq-full` — AGENTS п.8, полная телеметрия, настоящий 1080p-рендер (title-патч Belobug `VICTORY_OUTPUT`), второй путь плит, kelvaroq Group-1 (10 патчей), Group-2 (10 патчей) + мимика лиц (#927), новая cache `r8-group2`; финальный 480-с прогон: **6,5 fps ALL / 5,3 fps WORLD**, VRAM peak 6 319 МиБ, 0 ERROR/device loss; **плиты на воде остались**, чёрные лица в тёмных сценах остались (свет/тени RT — известное ограничение); ПК выключен после push (2026-11-27 ночь-утро)
+
+Ветка **`feat-r8-1080p-and-kelvaroq-full`** от `feat-kelvaroq-audit-and-water-fix` @ **`60c7dde`**. Коммиты: **`9646679`** (AGENTS п.8), **`3fff732`** (второй путь плит), **`66419b9`** (`VICTORY_FORCE_1080P` — настоящий title-патч), **`9c0e222`** (Group-1 kelvaroq, 10 патчей), **`e9b9341`** (Group-2 kelvaroq + NVIDIA 32-lane + мимика #927, новая cache-ревизия). Итог `60c7dde..HEAD`: **39 файлов, +5 004/−845**; `crates/victory-shader/**` впервые изменён (Group-2/facial) → новый каталог кэша; старый кэш **76 973 файла / 2 614 092 344 Б** не удалён и не перезаписан.
+
+### 30.1. Этап 0 — правила, телеметрия, дефолты
+
+- `AGENTS.md`: добавлен **пункт 8** — в начале каждого раунда проверять 5 репозиториев (`fxceless/victory-fork`, `Marvisak/VIctory`, `stellarr-studio/kelvaroq`, `Belobug/VIctory-Belobug-AMD`, `uiliannn/VItoriaBr`) через `gh` и включать новые фиксы CPU/VRAM/рендера в план.
+- `launch-game.ps1` / `run-road.ps1` (вне репозитория; снапшоты `audit\round8\harness-*-stage0.ps1`): по умолчанию теперь **`VICTORY_FPS_COUNTER=all`** (полная телеметрия), **`VICTORY_TILES_SMALL_WHEN_FULL_MB=256`** (на полной карте — уменьшенные mip-уровни вместо чёрной текстуры), **`VICTORY_WATCH_RESERVATION=1` + `VICTORY_WATCH_STATS=1`** (#1365), **`VICTORY_CARD_BUFFERS_MIN_KB=64`** (kelvaroq 0039 floor), **`VICTORY_FORCE_1080P=1`** и **`VICTORY_PERSISTENT_VIEWS=1` / `VICTORY_PAGE_MAPPING_RUNS=1`**. Контрольные плечи: `-FpsCounter 0`, `-WatchReservation ''`/`-NoWatchReservation`, `-Force1080p 0`, `-TilesSmallMb ''`, `-CardBuffersMinKb ''`.
+- Проверка Stage 0: 180-с smoke `road\r8-smoke0` — 0 ERROR, `VICTORY_TILES_SMALL_WHEN_FULL_MB` дал 2 462 уровня с tiles на полной карте; строки `card buffers… least size for the card: 64 KiB` и `write watch/frame: GetWriteWatch calls…` в логе; VRAM peak 7 464 МиБ (до force 1080p).
+
+### 30.2. Разведка (3 read-only субагента; отчёты в `audit\`)
+
+- **Скан 5 репозиториев + 1080p + плиты** — `audit\round8\subagent1-report.md` (46 КБ), `force-1080p.diff`, `water-plates-second-path.diff`, `raw\*`. Найдено: fxceless **#927** «Mouths move» (мимика; 16-битные typed views через `emit/halves.rs`/`half_views`), fxceless **#1287** (loose-LDS + 32-lane), **#1369** (восстановление lowering-режимов после паники), Marvisak **#3124** (SDWA sign-extension), **#3348/#3406** (wave width; не включены — нужна их инфраструктура), Belobug **`VICTORY_OUTPUT`** (единственный способ реально уменьшить внутренние render-target'ы — патч кода title), VItoriaBr #72 (placed UAV aliases — не включено). Новых код-патчей kelvaroq после аудита Round 7 нет.
+- **Group-1** — `audit\round8\group1\report.md`, `apply-check.log`, 10 патчей. Итог: `0025+0034` (scatter runs/page lifetime, безопасный финал), `0039` (ReBAR copies + floor/потолок), `0022` (GPU-upload inputs), `0015` (per-frame texture stage), `0016` (pipeline wait once), `0031` (root-bind cache), `0032` (relay copy runs), `0035` (queue2 landings), `0061` (`VICTORY_NO_DRAWS`). Не взяты: `0017`, `0028`, `0054`, `0053`, `0057`, `0021`, `0026`, `0002/0010/0023` (нужны модули отсутствующего crate/слишком конфликтны).
+- **Group-2 + NVIDIA 32-lane** — `audit\round8\group2\report.md`, 10 патчей (0047a/b, 0041a/b/c, 0033, 0050, 0051, 0052, 0053). Плюс `audit\round8\group2-facial\report.md` — **0100/0101** (порт #927: `emit/halves.rs`, `HostShader::half_views`, half-форматы/вьюхи в дескрипторной куче, half-места в таблицах draw, encode/decode кэша). `#3348/#3406` не включены; `0102` не нужен (SDWA уже в 0053); `0103` (чёрные лица, watch-биты e4245f3c) не делался — конфликтует с `LIGHT_REFRESH`/`ABSENT_*`.
+
+### 30.3. Шаг А — второй путь плит + настоящий `VICTORY_FORCE_1080P`
+
+- **Плиты** (`3fff732`): `mirror_copied_batch` делал tiled-слоты, но выбрасывал `Made.tiled` → слот не попадал в `tiled_shown`; при смене `first_shown()` дескриптор продолжал читать тайлы, отданные другой текстуре. Фикс: `record_tiled`/`forget_tiled` в null/stale-ветках, GPU-gated тест `copy_pass_tiled_slot_remakes_when_first_shown_changes`. Тесты 629→630.
+- **1080p** (`66419b9`): первая версия субагента (только present-скейлер) отклонена — она не создавала 1080p render-target'ы. Порт Belobug `VICTORY_OUTPUT`/`VICTORY_RENDER_SCALE` (GPL-3.0-or-later, `crates/victory-loader/src/force_1080p.rs`, 441 строка): title-патч по RVA **0x224352b** (output size), **0x247af25** (pool-check `int3` → `jmp +1`), **0x28f1e78** (own scale 2/3 → 1.0); каждый сайт сверяется побайтно, при другом build — WARN и не патчится. `VICTORY_FORCE_1080P=1` = output **1920×1080** + render scale **1.0**; `VICTORY_OUTPUT`/`VICTORY_RENDER_SCALE` — по отдельности. Наш `game_scarlett_master.exe` совпал с Belobug по всем контрольным RVA (OUTPUT/POOL_CHECK/OWN_SCALE/FFX_SCALE/PICKER/SET_SCREEN_SIZE); FFX/picker не переносились (Series S FidelityFX).
+- **Проверка**: `out.log` — `resolution: settings' output size applied (1920x1080)… Done`, pool-check Done, own scale (1) Done; `err.log` — `presenting to a window width=1920 height=1080`, `display mode reported…1920x1080`. 180-с A/B (Series X, 1280×720 topmost, fpsbox all, остальные дефолты равны):
+
+| 180-с прогон | ALL мс/fps | WORLD мс/fps | 500–1500 draws | VRAM peak/avg | swap chain |
+|---|---|---|---|---|---|
+| `road\r8-smoke-1080p` (force on) | **112,1 / 9,0** | **143,2 / 7,0** | **122,9 / 8,2** | **6 256 / 4 387 МиБ** | 1920×1080 |
+| `road\r8-smoke-noforce` (force 0) | 163,6 / 6,1 | 185,7 / 5,4 | 177,6 / 5,7 | 7 243 / 5 199 МиБ | 3840×2160 |
+
+  Выигрыш force: **+29 % WORLD fps** на этом отрезке, −1 ГБ VRAM peak; тесты 635 (5 новых). Визуальные различия 180-с отрезков не удалось честно привязать к флагу (разные моменты cutscene; чёрные лица встречались и до флага) — окончательный вердикт по 480-с прогону.
+
+### 30.4. Шаг Б — Group-1 kelvaroq (10 патчей, `9c0e222`)
+
+`0015` per-frame texture stage (`VICTORY_TEXTURE_STAGE_PER_FRAME=1`, 6 мс), `0016` `PIPELINE_WAIT_ONCE_MS=500`, `0025+0034` scatter grouping (один lock/remap-guard на ≤64 записи, view каждой страницы сохраняется), `0031` root-bind cache (`VICTORY_ROOT_BIND_CACHE=1`), `0032` relay copy runs, `0035` queue2 keep-landings, `0022` GPU-upload inputs (`VICTORY_GPU_UPLOAD_READONLY_MB=0`, A/B 64), `0039` ReBAR copies (`VICTORY_REBAR_COPIES_MB=0`, A/B 256, правило 1/10 бюджета + kept room + fallback), `0061` `VICTORY_NO_DRAWS=1` (диагностический потолок). Все новые переключатели **off по умолчанию**, поведение без них не менялось; floor/потолок card-buffers уже были в дереве и включены env-дефолтом `VICTORY_CARD_BUFFERS_MIN_KB=64`. Два тестовых фикса: инициализатор `Shader` в новом root-bind тесте (ambient/walks) и `#[cfg(test)]` у `shadow::register`. Тесты **642 passed / 0 failed**, `cargo check`=0.
+
+### 30.5. Шаг В — Group-2 + NVIDIA 32-lane + мимика (#927), новая cache (`e9b9341`)
+
+- **0047a/0047b**: GPU-метод `0x218` (precompiled compute), порядок элементов DXIL-signature по offset semantic-имени, скалярная копия EXEC как данные в lane-branch, логи wave width/refused стадий; **0041a** `CARD_HASH_WIDE` (64 потока на 64-КиБ кусок); **0041b** mesh payload 4 Б в PSV; **0041c** **mesh launch amplification** (`launch.hlsl/launch.rs/launch_code.rs`, бюджет списка, прямые `DispatchMesh`, plain-двойник для indirect; **on by default**, контроль `VICTORY_MESH_LAUNCH=0`); **0033** provably-empty wave64 mask; **0051** fxceless #1287 loose-LDS (off, `VICTORY_WAVE_LDS_LOOSE=1`) + точные GroupInfo/s_pack/s_bfm/s_mov/f64/lane-mask; **0052** #1369 lowering modes after panic; **0053** Marvisak #3124 SDWA sext; **0100/0101** #927 facial halves (рот/морфы: сеть лиц больше не читает нули). Новый каталог кэша **`<cache>/shaders-r8-group2`** (`0050`, `VICTORY_SHADER_CACHE_REVISION=0` — откат на старый `shaders`), соль ключа **2 → 3**; старый кэш не тронут. Тест-модуль `lower.rs` (23 КБ) вынесен в `emit/lower/tests.rs`, чтобы файл прошёл asset-policy 512 КиБ; тест `only_a_provably_empty_mask…` скорректирован под 0047b (копия EXEC через `s_or` теперь читается как данные). Тесты: **658 passed / 0 failed** при `cargo test --workspace -- --test-threads=1`; параллельный запуск GPU-тестов один раз упал `0xc0000005` (серийный — чистый), известный warp-флейк ретраился.
+- **Прогрев**: `target\release\victory.exe translate C:\GTA6_Files\shaders.rpf --warm all --jobs 12` (VICTORY_HOST_WAVE=32, VICTORY_VIEW_LIMIT=999999): **25 889 хэшей, 25 638 переведено, 251 не переводится; 229,2 с на 12 потоках**. Новый кэш: **25 641 файл / 872 069 095 Б**; старый **76 973 / 2 614 092 344 Б** не изменён. `host-pipelines.bin`: **1 103 444 436 → 1 180 542 530 Б** (новые mesh/amplification/plain PSO дописаны; не удалён).
+- **Смоук 180 с** `road\r8-shader-smoke`: 0 ERROR/device loss; mesh launch реально работает (`launched=true`, до 4 131 групп/кадр, 2 004 записей/кадр); cache hits 2 396 / misses 2. Первые world-кадры — **2,1 fps** из-за создания ~1 000 новых PSO; к концу 6 fps. Это ожидаемая цена первого запуска новой шейдерной библиотеки.
+
+### 30.6. Финальный контрольный прогон 480 с (`road\r8final`)
+
+Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты Раунда 8**: `FPS_COUNTER=all`, `TILES_SMALL_WHEN_FULL_MB=256`, `WATCH_RESERVATION=1+STATS`, `CARD_BUFFERS_MIN_KB=64`, `FORCE_1080P=1`, `PERSISTENT_VIEWS=1`, `PAGE_MAPPING_RUNS=1`; новый кэш + прогретая pipeline library. `worldAt=75`, **30/30 скриншотов**, 480 с, 0 ERROR, 0 device-loss, процесс закрыт чисто. Заголовок/`err.log`: `presenting to a window width=1920 height=1080`; title-патчи resolution Done.
+
+| метрика | значение |
+|---|---|
+| ALL | **153,1 мс / 6,5 fps** (n=84) |
+| WORLD | **189,5 мс / 5,3 fps** (n=70) |
+| WORLD t≥180 / ≥240 / ≥300 / ≥360 | 204,0 / 4,9 · 245,6 / 4,1 · 239,4 / 4,2 · 189,7 / 5,3 |
+| корзины draws 500–1500 / 1500–3000 / 3000–4500 / 4500+ | 145,9 / 6,9 · 204,0 / 4,9 · 344,3 / 3,0 (n=10) · 192,0 / 5,6 (n=12) |
+| draws median | 2 026 |
+| VRAM peak / avg / ≥7 900 МиБ | **6 319 / 5 495 МиБ / 0** |
+| `tiles_black` | 432 из 868 (50 %); small-tiles дано 8 409 уровней |
+| readback | copied=14 592, buffers_reused=15 464, buffers_made=47 |
+| dropped | 12 216 (r7a 15 797) |
+| mesh launch | 1 618–4 034 записей/кадр, 217–430 count'ов на CPU/кадр |
+
+Сравнение с Round 7 `road\r7a` (222,6/4,5 ALL, 253,7/4,0 WORLD, peak 7 754/avg 6 762, `tiles_black` 653/1152, dropped 15 797) — маршрут другой (median draws 2 026 против 2 251, но состав кадров иной), однако по сопоставимой корзине 500–1500: **145,9/6,9 против 180,4/5,6**; 1500–3000: **204,0/4,9 против 278,7** (r7a хуже); 3000–4500: 344,3/3,0 против 211,5/2,8 (хуже, n=10/14). Итог: абсолютный fps выше, VRAM заметно ниже, тяжёлые кадры местами хуже — нужен сцен-матчевый A/B.
+
+### 30.7. Визуальный итог (честно)
+
+- **Лица**: на `shot-420/450/465` лица детальные, кожа/одежда текстурированы, на 420 виден открытый рот — мимика/морфы оживают (#927 сработал). Чёрные лица в тёмных сценах остаются (`shot-170`: глаза/контур видны, лицо чёрное) — это известная нереализованная RT-подсветка/тени (README: «light in shadow missing»), не регрессия #927; watch-часть e4245f3c не переносилась.
+- **Плиты на воде — ОСТАЛИСЬ**: в `shot-465` (лодка, вода на фоне) и `shot-450` видны тёмные прямоугольники чужих уровней; второй путь (copy-pass tiled slots) механизм закрыл, но видимый артефакт не убрал → третий путь/причина: динамические `fresh_tables` (`draw.rs`), #574/#747 или `VICTORY_LEVELS_ON_DEMAND=0` A/B.
+- **Свет/overexposure**: на 170 тёмная сцена почти чёрная (лицо), на 420–465 нормальная экспозиция; вылетов нет, «мыльных» текстур вблизи не видно; один кадр `t=310` — 2 000 мс (создание PSO/загрузка), к 360 с стабильно 5,3 fps.
+- **No device loss** за 480 с; VRAM с запасом ~1,8 ГБ до 8 192; `buffers_made` 47 — пул readback не течёт.
+
+### 30.8. Дефолты, файлы, откат
+
+- Лаунчеры (вне репо, снапшоты `audit\round8\harness-*-stage0.ps1`; актуальные копии — `C:\GTA6_Port\launch-game.ps1`, `C:\GTA6_Port\run-road.ps1`): новые дефолты из 30.1; `launch-game.ps1` — `-NoWatchReservation`, `-Force1080p`, `-TilesSmallMb`, `-CardBuffersMinKb`; `run-road.ps1` — те же параметры + `-WatchReservation ''`/`-Force1080p 0` контроль, fpsbox остаётся `all` для мониторинга.
+- Откат шейдерного пакета без потери кода: `VICTORY_SHADER_CACHE_REVISION=0` (старый `<cache>/shaders`), `VICTORY_MESH_LAUNCH=0`, `VICTORY_CARD_HASH_WIDE=0`, `VICTORY_WAVE_ZERO_MASK=0`, `VICTORY_WAVE_LDS_LOOSE=0`; откат 1080p — `-Force1080p 0`/`VICTORY_FORCE_1080P=0` (title не патчится).
+- Артефакты: `audit\round8\subagent1-report.md`, `group1\{report.md,apply-check.log,NNNN-*.patch}`, `group2\{report.md,apply-check.log,NNNN-*.patch}`, `group2-facial\{report.md,0100,0101}`, `warm-cache.log`, `r8final-console.log`, `ab-r8{,-smoke0,-smoke-1080p,-smoke-noforce,-shader-smoke,-final}-analysis.txt`, `test-*.log`, `build-*.log`; прогоны `road\r8{,-smoke0,-smoke-1080p,-smoke-noforce,-shader-smoke,-final}`.
+- Тесты: 629 (конец Round 7) → 635 (force 1080p) → 642 (Group-1) → **658** (Group-2/facial), `cargo check --workspace`=0; полный прогон — серийный (`--test-threads=1`), параллельный GPU-тест-бинарь один раз упал `0xc0000005`.
+
+### 30.9. Что дальше
+
+1. **Плиты на воде**: проверить `VICTORY_LEVELS_ON_DEMAND=0` (A/B 2×300 с) — исключить tiled-путь; затем динамические `fresh_tables` в `draw.rs` (свежие таблицы не пишут `made[]`/`tiled_shown`) и #574/#747; смотреть `shot-4xx` на лодке.
+2. **Чёрные лица/свет**: перенести watch-часть e4245f3c (`VICTORY_PAGE_WRITES 1|2|8`, `texture_slots_page_written`) отдельным Group-1 шагом с A/B; затем ambient/RT-свет (известное ограничение README).
+3. **Mesh launch**: A/B `VICTORY_MESH_LAUNCH=0` на 2×300 с; первый запуск после новой cache создаёт ~1 000 PSO и стоит 1–3 fps — для игровых сессий прогреть pipeline library `victory translate --cache`/prebuild или оставить один прогревочный запуск.
+4. **251 refused shader / 3 compute pipelines** (`2da4beb386509b77`, `6b82bc7d22016cb5`, `02384a60fda6f2d0`): проверить `VICTORY_WAVE_LDS_LOOSE=1` на этих трёх (loose-LDS off по умолчанию), затем #3406/#3348 отдельным раундом.
+5. **Group-1 env A/B**: `VICTORY_ROOT_BIND_CACHE=1`, `VICTORY_TEXTURE_STAGE_PER_FRAME=1`, `VICTORY_GPU_UPLOAD_READONLY_MB=64`, `VICTORY_REBAR_COPIES_MB=256` (осторожно на 8 ГБ) — по одному флагу, 2×300 с.
+6. **Сцен-матчевый A/B** против `8eb61a6`/`r7a` (лодочная сцена, один маршрут), чтобы отделить эффект шейдерного пакета от разницы маршрутов; проверить `VICTORY_MESH_LAUNCH=0`/`CARD_HASH_WIDE=0` при просадке тяжёлых кадров.
+7. **Series S**: композита двух plane'ов в этой ветке нет (нужен мерж `feat-series-s-upscaler` #798/#1081); force-1080p на Series S — output 1080p, но FSR4-путь по-прежнему чёрный (pre-existing).
+8. Ветка запушена в `myfork`; режим — **Series X**. После успешного `git push` — штатное выключение ПК (`shutdown /s /t 60`).

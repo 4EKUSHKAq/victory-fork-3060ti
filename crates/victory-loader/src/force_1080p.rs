@@ -35,11 +35,12 @@
 //!   (+0x615c100: 3840x2160 at 60 Hz) becomes 2560x1440, the Settings
 //!   preview's viewport load (+0x58048d4, which loads the legacy 3840x2160
 //!   size) reads that display mode instead, the temporal scene scale
-//!   (+0x28f1e7e) becomes 1.0 and the output size 2560x1440: the title makes
-//!   a 1440p output with the interface laid out for it and no 4K pass runs.
-//!   The scanout reservation (+0x247ad4a, 64 MB) is left as it is (34 MB more
-//!   than a 1440p pair of buffers needs; our own buffer-pool check is jumped
-//!   over anyway).
+//!   (+0x28f1e7e) becomes 1.0 and the output size (2560x1440 or 1920x1080):
+//!   the title makes an output of that size with the interface laid out for it
+//!   and no 4K pass runs. The scanout reservation (+0x247ad4a, 64 MB: two tiled
+//!   4K buffers) is sized for the mode's own pair of buffers (see
+//!   [`scanout_code`]: 30 MB at 1440p, 18 MB at 1080p), so a native output also
+//!   returns 34 MB (1440p) or 46 MB (1080p) of VRAM.
 //!   From DexNom/VIctory's `native_1440p.rs` via trustno1-coder/VIctory-NVIDIA
 //!   (`apps/victory/src/native_1440p.rs`, GPL-3.0-or-later): four fields, and
 //!   their retail build hash, b99f876b74d4a77f…, is exactly our image's (the
@@ -61,6 +62,13 @@
 //!
 //! `VICTORY_NATIVE_1440P=1` (Round 10 default): output 2560x1440, the SDR
 //! display mode and the Settings viewport patched, render scale 1.0.
+//!
+//! `VICTORY_NATIVE_1080P=1` (Round 11): output 1920x1080 with the same fields -
+//! the display mode's 16-byte record becomes the title's own 1920x1080 row
+//! (+0x615c0e0: 1920x1080 at 60 Hz, flag 1; the stock SDR entry is the 4K row
+//! at +0x615c100), so the interface is laid out at 1080p instead of the
+//! blown-up Round 8 picture, where only the output size changed. It wins over
+//! `VICTORY_NATIVE_1440P`.
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [
@@ -104,6 +112,24 @@ pub fn native_1440p() -> bool {
 /// The size `VICTORY_NATIVE_1440P=1` asks for.
 pub const NATIVE_1440P: (u32, u32) = (2560, 1440);
 
+/// `VICTORY_NATIVE_1080P=1`: a true 1920x1080 output with the title's own
+/// display mode and Settings viewport for it (Round 11). It wins over
+/// [`native_1440p`], which in turn wins over [`forced`].
+pub fn native_1080p() -> bool {
+    let spec = std::env::var("VICTORY_NATIVE_1080P").ok();
+    match spec.as_deref().map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => {
+            eprintln!("VIctory: VICTORY_NATIVE_1080P={other}: expected 1 (on) or 0 (off)");
+            false
+        }
+    }
+}
+
+/// The size `VICTORY_NATIVE_1080P=1` asks for, the title's own 1080p mode.
+pub const NATIVE_1080P: (u32, u32) = (1920, 1080);
+
 /// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `VICTORY_FORCE_1080P=1` without
 /// it asks for 1920x1080. `None` if unset (or not a mode, said why).
 pub fn asked_output() -> Option<(u32, u32)> {
@@ -117,6 +143,9 @@ pub fn asked_output() -> Option<(u32, u32)> {
             return None;
         }
         return size;
+    }
+    if native_1080p() {
+        return Some(NATIVE_1080P);
     }
     if native_1440p() {
         return Some(NATIVE_1440P);
@@ -143,7 +172,7 @@ pub fn asked_render_scale() -> Option<f32> {
         }
         return scale;
     }
-    if native_1440p() {
+    if native_1080p() || native_1440p() {
         return Some(1.0);
     }
     forced().then_some(1.0)
@@ -205,6 +234,48 @@ pub fn pool_check_code() -> Vec<u8> {
     let mut c = POOL_CHECK.bytes[..8].to_vec();
     c[6] = 0xeb;
     c
+}
+
+/// The scanout reservation (+0x247ad4a): `mov ecx, 4000000h`, the 64 MB room
+/// for two tiled 3840x2160 RGBA8 buffers. The native patches size it for their
+/// own output (two buffers, each rounded to 64 KiB, the pair rounded up to
+/// 2 MiB - the unit of the title's allocation check): 30 MB at 1440p, 18 MB at
+/// 1080p, so 34 MB and 46 MB of VRAM come back. From VIctory-NVIDIA's
+/// `native_1440p.rs`, which computes it from `victory_formats::texture::Texture`.
+pub const SCANOUT_RESERVATION: Site = Site {
+    at: 0x247ad4a,
+    what: "the scanout reservation (64 MB)",
+    bytes: &[0xb9, 0, 0, 0, 4], // mov ecx, 4000000h
+};
+
+/// The room two scanout buffers of `width` x `height` need: each tiled RGBA8
+/// buffer rounded to 64 KiB, the pair rounded up to 2 MiB (the unit of the
+/// title's allocation check at [`POOL_CHECK`]). `None` if victory-formats does
+/// not know the layout.
+pub fn scanout_pool_size(width: u32, height: u32) -> Option<u32> {
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+    let texture = Texture::new(&TextureDesc {
+        dimension: Dimension::Tex2d,
+        width,
+        height,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28, // RGBA8
+        samples: 1,
+        swizzle: Swizzle::SW_64KB_D_X,
+    })
+    .ok()?;
+    let pool = (texture.size.next_multiple_of(64 * 1024) * 2).next_multiple_of(2 << 20);
+    u32::try_from(pool).ok()
+}
+
+/// What goes at [`SCANOUT_RESERVATION`] for `width` x `height`: the same
+/// `mov ecx, imm32`, the immediate made the pair of buffers' room.
+pub fn scanout_code(width: u32, height: u32) -> Option<Vec<u8>> {
+    let pool = scanout_pool_size(width, height)?;
+    let mut c = vec![SCANOUT_RESERVATION.bytes[0]]; // mov ecx, imm32
+    c.extend(pool.to_le_bytes());
+    Some(c)
 }
 
 /// The Series X SDR display mode entry (+0x615c100): 3840x2160 at 60 Hz in the
@@ -367,15 +438,25 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
-        if (w, h) == NATIVE_1440P {
-            // The native 1440p patch's fields: the display mode the title reads,
-            // its interface size and Settings' preview viewport.
+        if (w, h) == NATIVE_1080P || (w, h) == NATIVE_1440P {
+            // The native fields: the display mode the title reads (the game's
+            // own record for that size), Settings' preview viewport and the
+            // scanout reservation. The size is what matters, so the same
+            // bytes serve VICTORY_NATIVE_1080P, VICTORY_NATIVE_1440P and a
+            // VICTORY_OUTPUT of that size.
             asked.push((&SDR_MODE, sdr_mode_code(w, h), format!("{w}x{h}")));
             asked.push((&UI_VIEWPORT, ui_viewport_code(), format!("{w}x{h}")));
-        } else if native_1440p() {
+            match scanout_code(w, h) {
+                Some(code) => asked.push((&SCANOUT_RESERVATION, code, format!("{w}x{h}"))),
+                None => eprintln!(
+                    "VIctory: {w}x{h}: victory-formats does not know the scanout layout, \
+                     the reservation is left as it is"
+                ),
+            }
+        } else if native_1080p() || native_1440p() {
             eprintln!(
-                "VIctory: VICTORY_NATIVE_1440P=1 with VICTORY_OUTPUT={w}x{h}: \
-                 the display-mode and viewport patches are for 2560x1440 only, left alone"
+                "VIctory: the native display patch with VICTORY_OUTPUT={w}x{h}: \
+                 its fields are for 1920x1080 and 2560x1440 only, left alone"
             );
         }
     }
@@ -509,6 +590,32 @@ mod tests {
         assert_eq!(loaded, SDR_MODE.at as i64, "the load reads the display mode");
         assert_eq!(UI_VIEWPORT.bytes, [0xc5, 0xfb, 0x10, 0x0d, 0x10, 0xf0, 0x13, 0x05]);
         assert_eq!(NATIVE_1440P, (2560, 1440));
+    }
+
+    /// The native 1080p patch asks for the size of the title's own third mode
+    /// entry (+0x615c0e0: 1920x1080 at 60 Hz, flag 1) - the record the patched
+    /// SDR entry becomes - and the scanout reservation for that pair of
+    /// buffers.
+    #[test]
+    fn the_native_1080p_fields_are_the_titles_own_1080p_mode() {
+        const OWN_1080P: [u8; 16] =
+            [0x80, 0x07, 0, 0, 0x38, 0x04, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
+        let mode = sdr_mode_code(1920, 1080);
+        assert_eq!(&mode[..8], &OWN_1080P[..8], "the game's own 1920x1080 row");
+        assert_eq!(&SDR_MODE.bytes[8..], &OWN_1080P[8..], "60 Hz and the flag stay");
+        assert_eq!(NATIVE_1080P, (1920, 1080));
+        // The reservation's stock immediate is 64 MB; the pairs are 64 MB at
+        // 4K (the value the stock code writes), 30 MB at 1440p and 18 MB at
+        // 1080p - 34 MB and 46 MB of VRAM come back.
+        assert_eq!(SCANOUT_RESERVATION.bytes, [0xb9, 0, 0, 0, 4]);
+        assert_eq!(scanout_pool_size(3840, 2160), Some(0x0400_0000));
+        assert_eq!(scanout_pool_size(2560, 1440), Some(30 << 20));
+        assert_eq!(scanout_pool_size(1920, 1080), Some(18 << 20));
+        // The site keeps its instruction; only the immediate moves.
+        let code = scanout_code(1920, 1080).unwrap();
+        assert_eq!(code, [0xb9, 0, 0, 0x20, 0x01]);
+        assert_eq!(code.len(), SCANOUT_RESERVATION.bytes.len());
+        assert_eq!(code[0], SCANOUT_RESERVATION.bytes[0]);
     }
 
     #[cfg(windows)]

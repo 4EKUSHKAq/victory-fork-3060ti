@@ -730,6 +730,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "victory-core",
+ "victory-formats",
  "victory-pe",
  "windows-sys",
 ]

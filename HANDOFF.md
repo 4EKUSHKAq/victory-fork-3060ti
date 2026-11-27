@@ -550,3 +550,46 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 2. diag-билд + прогрев кэша + `VICTORY_CAPTURE` → дамп классов масок и non-finite экспозиции; по нему решить, нужен ли отдельный mask-фолбэк поверх lit-флора.
 3. Бюджеты: проверить, снизились ли перезаливы тайлов на сцене у машины копов при равных `draws`-корзинах; кандидаты: victory-leafy #24 (CSV-гейджи), Belobug #540, #223, fxceless #1466/#1431.
 4. `VICTORY_DELTA_LAND` (батчевый) — довести до отсутствия регрессии, иначе оставить off.
+
+## 37. Раунд 14 — батчевый DELTA_LAND (3 KiB/8 вызовов), порты радара (#1431, #3429), сцен-матчевый A/B по корзинам `draws`
+
+Ветка **`main-3060ti`**. Коммиты: **`281e706`** (батчевый landing: склейка до 3072 Б, ≤8 `write_mapped` на piece), **`b6074b5`** (#1431 `joined()` in place + #3429 счётчики VirtualQuery — без изменения поведения), этот docs. `victory-shader` не тронут.
+
+### 37.1. Радар (read-only, 6+ репозиториев)
+- **fxceless #1431** (`9342db15f0`, open): `shadow::joined` — тот же sorted union без второй аллокации (upstream 2.2→1.4 µs на 512 диапазонов) — **портирован**.
+- **Marvisak #3429** (open): копировальный терм `VirtualQuery` был невидим в статистике (`C::Queries/QueryUs` никогда не инкрементировались) — **портирован** (telemetry only).
+- **fxceless #1466** (`0e2d0a9bb0`): SKIP — в нашем дереве нет механизма `PULL_AFTER/take_written/Shadow::pull_back` (наш copy-back — readback-тикеты `backreads.rs/texback.rs`), это не «та же страница ещё раз».
+- **Belobug #540** (`af5bdc9720`): ambient-фолбэк не должен готовить BVH-пайплайны; у нас `ambient::on()` зовёт `builder_runs()`→`make::now` (синхронная компиляция), но `VICTORY_BVH_BUILDER` по умолчанию off → латентно, отложено (STUDY, кандидат на следующий раунд вместе с RT-трейсом).
+- **Belobug #223** (SKIP: у нас нет `vram_keep/keep_shown`; наш 8 GiB policy уже 94% + четверть-бюджетный резерв), **Marvisak #3457** (SKIP: нет `bindless.rs`/`evict_unused`), **#3437** (STUDY: у нас уже есть `VICTORY_WINDOW_KB`=4 MiB), **101Leafy #24/#30** (STUDY: CSV-гейджи, частично портируемо). trustno1: после `3f60eeee0b` новых copy-back/landing/`write_mapped`/pacing работ нет; HEAD `959dcaf609` — только mouse/HAGS и #29 (violet probes, уже портирован в Раунде 12).
+- Важно: у fxceless #1466/#1431 статус OPEN (не влиты); числа upstream — их, не наши.
+
+### 37.2. Шаг 1 — код
+- `shadow.rs`: `DELTA_GAP 512→3072`, `DELTA_RUNS 64→8` — меньше системных вызовов на штормах; тест обновлён (2048..=4096, ≤8). Гейт: check 0/test 0 failed (флейк §23.3 пропущен).
+- `shadow.rs::joined()`: `sort_unstable`+`dedup_by` на месте (порт #1431, GPL-3.0-or-later), без второй аллокации; `host.rs::read_sparse`: `C::Queries/QueryUs` вокруг `VirtualQuery` (порт #3429) — только диагностика.
+
+### 37.3. Шаг 2 — релиз и A/B (`NATIVE_1440P=1`, `RENDER_SCALE=0.75`, 240 с, телеметрия `all`+`WATCH_STATS=1`)
+Релиз 9 342 848 B. Прогоны: `road\r14-run1` (control: `RT_SHADOW=off`, `DELTA_LAND=0`) и `road\r14-run2` (`RT_SHADOW=lit`, новый `DELTA_LAND=1`).
+
+| метрика (world) | Run 1 контроль | Run 2 lit+батч |
+|---|---|---|
+| кадры n | 130 | 177 |
+| p50 | **8,4 fps / 119,5 мс** | **5,0 fps / 200,0 мс** |
+| p90 / p95 / p99 | 934,3 / 1 440,5 / 1 876,3 мс | 539,2 / 626,5 / 940,4 мс |
+| max | **7 501,0 мс** | 2 560,9 мс |
+| фризы >150 / >500 мс | 61 / 28 | 114 / 26 |
+| VRAM peak / mean | 7 547 / 5 999 MB | 7 546 / 5 982 MB |
+| GPU util p50/p90 | 36 / 50 % | 34 / 53 % |
+| процесс commit | 19 110 MB | 19 824 MB |
+
+Топ-5 фризов:
+- run1: **7501 мс** (GPU=473,6; making 94,0; copies 61,5 ms/119 MB; textures 9,4 ms/15,8 MB; back 20,3), 1440,5 (GPU 50,9), 1365,6 (**GPU 925,6**), 1320,2, 934,3;
+- run2: 2560,9 (making 178,7; copies 115,0/112,9 MB; textures 96,3/180,9 MB; GPU 109,7; back 68,9), 1343,8 (copies 157,1/197,8 MB), 940,4 (textures 126,3/212,5 MB), 595,3, 541,2 (back 139,6, dropped 922).
+- CPU: у run1 самый занятый поток — victory-heap 46%, у run2 — victory-submit 77% (в разные моменты).
+
+**По равным корзинам `draws`** (A=run1, B=run2): 500: +56 мс; 600: +39; 800: **-56**; 900: +41; 1000: +27; 1100: **-456**; 1200: **-184**; 3500: **-81** — знаки смешанные, сцены не совпадают (n по 3–43), поэтому **ни `RT_SHADOW=lit`, ни `DELTA_LAND=1` не закреплены по умолчанию** (оба остаются opt-in), регрессии по коду нет, но и подтверждённого выигрыша нет.
+Региональные метрики яркости (face/water/beach/sky, mean) на одинаковых кадрах: shot-45 у обоих совпадает (0,629/0,523/0,588/0,448); дальше сцены разные (run2 shot-105 темнее: face 0,140 против 0,537) — сравнение не показательно.
+
+### 37.4. Закрепление и осталось
+- Профиль рендера/телеметрии не менялся: `NATIVE_1440P=1`, `RENDER_SCALE=0.75`, `FPS_COUNTER=all`, `WATCH_STATS=1`, `BAKE=25`, `TILES_SMALL=512`, тихий харнесс; дефолты `RT_SHADOW`/`DELTA_LAND` — off.
+- Телеметрия: `audit/round13/r13-analyze.ps1` теперь сам считает процентили, фризы >150/>500 мс, **топ-5 самых долгих кадров с полной разбивкой** (making/copies MB/textures MB/GPU/back/dropped) и **региональные метрики яркости** по скриншотам (face/water/beach/sky, mean/p50/dark%), плюс «no room», tiles_black, readback, VRAM/GPU/CPU, commit.
+- Осталось: сцен-матч с фиксированной камерой (сейчас сцены разные), diag-дамп масок, порт Belobug #540 (латентный), разбор victory-submit 77% и 7,5-секундного фриза run1 (GPU 473 мс + неучтённое ожидание), бюджеты #26 проверить на равных корзинах.

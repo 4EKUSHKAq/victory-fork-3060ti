@@ -90,7 +90,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    // For elements packed in one register the validator compares the
+    // offsets of their semantic names. Channel order can be different.
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -203,7 +205,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
     if let Some((mesh, shared)) = p.mesh {
+        // MSInfo: group-shared bytes, view-dependent bytes, payload bytes,
+        // the vertex and primitive maximums.
         info[0..4].copy_from_slice(&shared.to_le_bytes());
+        info[8..12].copy_from_slice(&super::shader::MESH_PAYLOAD_BYTES.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
         info[14..16].copy_from_slice(&(mesh.max_primitives as u16).to_le_bytes());
         info[26] = vectors(p.prims) as u8;
@@ -399,6 +404,30 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two elements share a register, with the high channels declared
+    /// first. Both signatures must keep their semantic offsets in order.
+    #[test]
+    fn packed_signature_rows_follow_their_name_offsets() {
+        let element = |name: &str, col| SigElement {
+            name: name.to_owned(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let elements = [element("COLOR", 2), element("TEXCOORD", 0)];
+        for input in [false, true] {
+            let bytes = signature(&elements, input);
+            assert_eq!(bytes[8 + 24], 0b1100);
+            assert_eq!(bytes[8 + 32 + 24], 0b0011);
+        }
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

@@ -113,9 +113,37 @@ impl Config {
         subdir(&self.cache_dir, sub)
     }
 
+    /// `<cache>/shaders-<revision>`: the translated shaders. A run never
+    /// reads the entries of another revision (the entry key also carries
+    /// the translator's fingerprint), and the old directory stays for a
+    /// rollback. `VICTORY_SHADER_CACHE_REVISION` names another revision,
+    /// `0` the old `<cache>/shaders`.
+    pub fn shader_cache_subdir(&self) -> Result<PathBuf> {
+        let revision = std::env::var("VICTORY_SHADER_CACHE_REVISION").ok();
+        subdir(&self.cache_dir, &shader_cache_dir_name(revision.as_deref()))
+    }
+
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
+    }
+}
+
+/// The shader cache the builds from Round 8 on read and write: the
+/// translator changed (`crates/victory-shader`), so a new directory is
+/// started rather than mixing the old entries (which stay where they are).
+const SHADER_CACHE_REVISION: &str = "r8-group2";
+
+/// The directory name [`Config::shader_cache_subdir`] uses: the revision
+/// after `shaders-`, or the old `shaders` for a rollback (`0`, empty).
+fn shader_cache_dir_name(revision: Option<&str>) -> String {
+    match revision.map(str::trim) {
+        Some("0") | Some("") => "shaders".to_owned(),
+        Some(other) if other.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c)) => {
+            format!("shaders-{other}")
+        }
+        Some(_) => format!("shaders-{SHADER_CACHE_REVISION}"),
+        None => format!("shaders-{SHADER_CACHE_REVISION}"),
     }
 }
 
@@ -193,6 +221,15 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn the_shader_cache_directory_carries_the_revision() {
+        assert_eq!(shader_cache_dir_name(None), "shaders-r8-group2");
+        assert_eq!(shader_cache_dir_name(Some("")), "shaders");
+        assert_eq!(shader_cache_dir_name(Some("0")), "shaders");
+        assert_eq!(shader_cache_dir_name(Some("try-2")), "shaders-try-2");
+        assert_eq!(shader_cache_dir_name(Some("../x")), "shaders-r8-group2");
     }
 
     #[test]

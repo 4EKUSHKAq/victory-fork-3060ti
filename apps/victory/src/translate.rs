@@ -175,7 +175,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     // (what is done stays in the cache; the next warm-up goes on from there).
     let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.shader_cache_subdir()?);
     let paths = crate::default_paths(paths)?;
     let threads = jobs.unwrap_or(4).max(1);
     let began = std::time::Instant::now();
@@ -234,7 +234,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
 }
 
 /// `translate --cache`: every distinct container found goes through the
-/// shader cache a run reads (`<cache>/shaders`), by the run's code, so a
+/// shader cache a run reads (`<cache>/shaders-<revision>`), by the run's code, so a
 /// run finds it translated or refused. With `pipelines`, the host device
 /// is made first (a run translates with the facts it gives: wave size,
 /// view heap clamp and heap map), and then the shader pack's pipelines go
@@ -246,7 +246,7 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
     let cfg = victory_core::Config::load()?;
     // The shader cache, and the pipeline library beside it, as a run
     // sets them (`d3d12x::use_shader_cache`).
-    let shaders = cfg.cache_subdir("shaders")?;
+    let shaders = cfg.shader_cache_subdir()?;
     victory_hle::modules::d3d12x::use_shader_cache(shaders.clone());
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     if pipelines {

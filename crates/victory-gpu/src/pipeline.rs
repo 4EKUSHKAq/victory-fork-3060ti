@@ -712,6 +712,29 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Slot 0x218 tries a precompiled compute pipeline. The caller looks up
+/// a cache entry by key, fills in its root signature and passes the four
+/// address and length pairs after it. The first pair holds only 28 bytes.
+/// On a miss the caller retries at 0x1f0 with its full shader container.
+pub(crate) extern "system" fn cached_compute(
+    _: This,
+    _desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    if !out.is_null() {
+        // SAFETY: the caller supplies the pipeline out pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if misses.is_power_of_two() {
+        tracing::info!(misses, "precompiled compute cache miss at 0x218; the caller can retry with its shader at 0x1f0");
+    }
+    object::E_NOTIMPL
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -1044,6 +1067,7 @@ mod tests {
             user_data: (0..2).map(|i| UserData { index: i, slot: 0, root: RootType::Constants, dword: i }).collect(),
             root_uavs: vec![1], root_cbvs: vec![], root_srvs: vec![],
             root_indexed_views: vec![], samplers: vec![], static_samplers: vec![],
+            half_views: vec![],
         };
         let shader = Arc::new(Shader {
             hash: "root binding test".into(), stage: "compute", container: Vec::new(),
@@ -1112,6 +1136,32 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
         slot::<extern "system" fn(This) -> u32>(pipe, 0x10)(pipe);
         unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+    }
+
+    /// A miss in the precompiled cache leaves the caller free to supply
+    /// its compute shader through the other device method.
+    #[test]
+    fn cached_compute_miss_falls_back_to_the_compute_container() {
+        use crate::object::slot;
+        type Cached = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        type Compute = extern "system" fn(This, *const ComputeHead, u32, *const u8, *const Iid, *mut This) -> HRESULT;
+        let device = crate::device::device();
+        let pair_data = [0u32; 7];
+        let mut entry = [0usize; 9];
+        for pair in entry[1..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&[pair_data.as_ptr() as usize, std::mem::size_of_val(&pair_data)]);
+        }
+        let mut p = device;
+        assert!(slot::<Cached>(device, 0x218)(device, entry.as_ptr().cast(), &PIPELINE_IIDS[0], &mut p) < 0);
+        assert!(p.is_null());
+        let code = [1u8, 2, 3, 4];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode { code: code.as_ptr(), size: code.len() },
+        };
+        assert_eq!(slot::<Compute>(device, 0x1f0)(device, &desc, 0, std::ptr::null(), &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("compute", code.to_vec())]);
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     #[test]

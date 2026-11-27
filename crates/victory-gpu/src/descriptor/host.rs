@@ -933,7 +933,8 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 /// heap is made: a shader keeps the limit it was translated with, and the
 /// title makes 25 pipelines (their shaders translated at once) before it
 /// makes its view heap. Called before a shader is translated and before a
-/// view heap is made.
+/// view heap is made; the host device calls [`probe_view_limit_on`] at its
+/// own making, which is the earliest of all.
 ///
 /// Every host clamps. A host that caps view heaps at [`PORTABLE_VIEWS`]
 /// (NVIDIA) hung on a view index past the heap; one that does not (AMD
@@ -943,9 +944,21 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 /// any host.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
+    if ONCE.is_completed() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    ONCE.call_once(|| probe_view_limit_on(&host.device));
+}
+
+/// As [`probe_view_limit`], at the making of the device itself (upstream
+/// pull request 3476's `view_limit`): a shader translated before the first
+/// translation asks would otherwise be translated with no clamp known, and
+/// the shader cache's key is made from the limit too.
+pub(crate) fn probe_view_limit_on(device: &ID3D12Device) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(_host) = host() else { return };
-        let views = if takes_views(UNCAPPED_VIEWS) {
+        let views = if takes_views_on(device, UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
@@ -970,9 +983,14 @@ pub(crate) fn probe_view_limit() {
 /// hold in one heap.
 pub(crate) fn takes_views(count: u32) -> bool {
     let Some(host) = host() else { return false };
+    takes_views_on(&host.device, count)
+}
+
+/// As [`takes_views`], on `device` (before the host is up).
+fn takes_views_on(device: &ID3D12Device, count: u32) -> bool {
     // SAFETY: plain heap creation; the heap is released at once.
     let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             NumDescriptors: count,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,

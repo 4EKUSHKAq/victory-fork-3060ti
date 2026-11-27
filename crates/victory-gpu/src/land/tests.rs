@@ -8,12 +8,24 @@
 //! `watch::again_after_change` waiting, of `watch::writes`/notes and the
 //! ignored measurement of the foreign tree are left out (the features are
 //! not in this tree; see the notes file).
+//!
+//! The test of the landed-beside notes ([`Notes::flush`]'s one asking for
+//! the job's blocks) is a port of the same from that tree, read at
+//! `d12eb1b`, functions `watch.rs:1852-1934`, `shadow.rs:4181-4256`,
+//! `land.rs:481-548`; adapted to this tree: whole 64 KiB blocks (this
+//! tree's journal unit) instead of 4 KiB pages and parts, and a
+//! write-watched allocation made here (the runtime's `xmem` makes the
+//! title's).
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
 };
+
+/// As the runtime makes the title memory [`crate::watch`] asks the kernel
+/// about: write-watched pages.
+const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 struct Random(u64);
 
@@ -38,6 +50,23 @@ impl Pages {
                 std::ptr::null(),
                 len,
                 MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!at.is_null());
+        Pages(at.cast(), len)
+    }
+
+    /// As the runtime makes the title's: committed with write watching, so
+    /// that [`crate::watch`] can ask the kernel about its pages (a landing
+    /// resets the bits of what it wrote, [`block_reset`]).
+    fn watched(len: usize) -> Pages {
+        // SAFETY: plain allocation.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
                 PAGE_READWRITE,
             )
         };
@@ -399,4 +428,47 @@ fn landings_beside_title_writes_lose_nothing() {
             }
         }
     });
+}
+
+/// [`Notes::flush`] makes one asking for the whole job: the journal's
+/// `asked` moves by one, and every block the job noted carries that one
+/// asking's number.
+///
+/// Port of the "one asking for the job's blocks" part of the notes tests of
+/// `trustno1-coder/VIctory-NVIDIA` (GPL-3.0-or-later), read at `d12eb1b`;
+/// adapted to this tree: whole 64 KiB blocks, with no 4 KiB parts.
+#[test]
+fn a_jobs_blocks_are_noted_with_one_asking() {
+    const BLOCKS: usize = 3;
+    let pages = Pages::watched(BLOCKS * BLOCK);
+    let at = pages.0 as usize;
+    crate::watch::forget_for_test(at, BLOCKS * BLOCK);
+    let base = at / BLOCK;
+    let mut notes = Notes::default();
+    for block in base..base + BLOCKS {
+        notes.pages.push(block);
+        // No copy: what is under test is the asking the note is made at.
+        notes.landed.push((block, std::ptr::null()));
+    }
+    let before = crate::watch::asked_for_test();
+    notes.flush();
+    assert_eq!(
+        crate::watch::asked_for_test(),
+        before + 1,
+        "the job's blocks took more than one asking"
+    );
+    // After the note, an asking about the range reports every block at the
+    // note's one number.
+    let (now, written) = crate::watch::writes(at, at + BLOCKS * BLOCK, true).expect("write-watched");
+    assert_eq!(written.len(), BLOCKS, "not every block was noted: {written:?}");
+    assert!(
+        written.iter().all(|&(block, asking)| (base..base + BLOCKS).contains(&block) && asking < now),
+        "a block was not noted at this asking: {written:?}"
+    );
+    assert!(
+        written.iter().all(|&(_, asking)| asking == written[0].1),
+        "the blocks were noted at more than one asking: {written:?}"
+    );
+    assert!(notes.is_empty_for_test(), "the notes were not cleared");
+    crate::watch::forget_for_test(at, BLOCKS * BLOCK);
 }

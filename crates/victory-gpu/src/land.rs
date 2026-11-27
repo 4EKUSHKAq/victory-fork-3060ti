@@ -31,8 +31,26 @@
 //! `crate::watch::writing` opened its guards; a page of title memory that
 //! is not there is counted and left to the next landing rather than waited
 //! for (`crate::watch::again_after_change` is not ported); no timeline
-//! spans, no fast-core priority pinning, and the notes are a no-op (this
-//! tree's `watch` keeps no landed-block bits).
+//! spans and no fast-core priority pinning.
+//!
+//! The landed-beside bookkeeping is ported too ([`taken`], [`Notes`],
+//! [`crate::shadow::Shadow::landed`]). Because this tree's write goes
+//! through the title's own address, the kernel's write watch sees the
+//! landing's stores as the title's: so a block is noted only if
+//! [`block_clean`] found it clean before the merge, its bits are reset after
+//! it ([`block_reset`]), and the copy the landing went through is told it
+//! holds the block. Noted after the bytes are in and after the reset, never
+//! before. A title write to one of the block's pages between the check and
+//! the reset is lost to the write watch: the same accepted hole
+//! `Shadow::put_back_quiet` names, and `VICTORY_LAND_TAKEN=0` restores the
+//! Round-19 behaviour.
+//!
+//! Port of the landed-beside bookkeeping from `trustno1-coder/VIctory-NVIDIA`
+//! (GPL-3.0-or-later), read at `d12eb1b`; functions `watch.rs:1852-1934`,
+//! `shadow.rs:4181-4256`, `land.rs:481-548`; adapted to this tree: whole
+//! 64 KiB blocks instead of 4 KiB pages and parts (the journal's unit), no
+//! `LANDED` record (nothing here reads one), no alias pages (`elsewhere`),
+//! and the write-watch reset stands in for `watch::block_published`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -90,6 +108,44 @@ pub(crate) fn skip_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
 }
 
+/// Whether what a landing put into title memory is noted at the end of its
+/// job ([`Notes::flush`], [`crate::watch::landed_blocks`]) and the copy it
+/// went through is told it holds it ([`crate::shadow::Shadow::landed`]);
+/// `VICTORY_LAND_TAKEN=0` turns both off, and then nothing of the kernel's
+/// write watch is asked or reset either: the landing copies and sends its
+/// blocks again exactly as before this was ported.
+///
+/// What a landing puts into title memory the copy holds already: the card
+/// wrote it there, and a copy in the card's memory was given it on the CPU's
+/// side by the same merge. But through the title's own address the kernel
+/// counts the block as written, for that copy as for every other one, so the
+/// next refresh copied the whole block, sent it up and had the card hash it
+/// again. The landing notes it instead, and the copy it went through notes
+/// itself current: only where one copy alone landed in the block (two would
+/// each hold only their own bytes of it).
+///
+/// Why the write watch is asked first: this tree's landing stores through
+/// the title's own address, so a note alone buys nothing — the kernel would
+/// report the block with a number above the note's, and every copy, the one
+/// that landed included, would take it again. [`block_clean`] before the
+/// stores and [`block_reset`] after them are what keep the kernel silent
+/// (the same pair `crate::shadow::put_back_quiet` uses, with the same
+/// accepted hole: a title write between the check and the reset is lost to
+/// the write watch).
+pub(crate) fn taken() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TAKEN").is_none_or(|v| v != "0"))
+}
+
+/// Whether a copy in the card's memory compares the pages a landing noted
+/// with title memory and leaves them as they are where they are equal,
+/// instead of copying them and sending them up again (`VICTORY_LAND_ECHO`,
+/// on by default; nothing without [`taken`]).
+pub(crate) fn echo_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| taken() && std::env::var_os("VICTORY_LAND_ECHO").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame-rate line; microseconds first.
 pub(crate) mod stat {
     /// The pieces to fetch gathered and put in the order they are landed.
@@ -105,7 +161,8 @@ pub(crate) mod stat {
     pub(crate) const BACK_ALL: usize = 5;
     /// In the jobs: waiting for the lock against the title's bytes going in.
     pub(crate) const LOCK: usize = 6;
-    /// In the jobs: guards opened before a write.
+    /// In the jobs: guards opened before a write, and the notes at the end
+    /// of a job.
     pub(crate) const NOTES: usize = 7;
     /// The flights' ranges done with; the rest of the landing.
     pub(crate) const DONE: usize = 8;
@@ -129,7 +186,23 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 21;
     /// Jobs.
     pub(crate) const JOBS: usize = 22;
-    pub(crate) const COUNT: usize = 23;
+    /// Blocks of 64 KiB that went in with their write watch clean before the
+    /// merge and reset after it (noted), and those it was not clean for (the
+    /// title wrote there first, or the kernel could not answer: copied again
+    /// by the kernel's word, not noted).
+    pub(crate) const QUIET: usize = 23;
+    pub(crate) const UNQUIET: usize = 24;
+    /// Blocks noted in the journal at the end of their job, and those of them
+    /// the copy that landed through was told it holds (and their bytes).
+    pub(crate) const LANDED: usize = 25;
+    pub(crate) const STAMPED: usize = 26;
+    pub(crate) const STAMPED_BYTES: usize = 27;
+    /// Bytes of landed pages compared in copies in the card's memory that
+    /// were equal to the copy's side (nothing copied, nothing sent up), and
+    /// those that differed and went up.
+    pub(crate) const ECHO: usize = 28;
+    pub(crate) const ECHO_SENT: usize = 29;
+    pub(crate) const COUNT: usize = 30;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -200,6 +273,24 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    // Only with the landed-beside notes on: otherwise every one of these is
+    // 0 and the line says nothing (VICTORY_LAND_TAKEN=0 is the old arm).
+    if taken() {
+        tracing::info!(
+            "landed beside the guards per frame (VICTORY_LAND_TAKEN={}): {:.0} blocks of 64 KiB went in with their write \
+             watch clean and reset, {:.0} did not (the title wrote there first, or the kernel could not answer; copied \
+             again by the kernel's word); of the noted {:.0} the copy that landed through is told it holds ({:.1} MB the \
+             next refresh need not copy); copies in the card's memory compared landed pages: {:.1} MB equal to the copy's \
+             side (not sent up), {:.1} MB different (sent)",
+            u8::from(taken()),
+            s[stat::QUIET],
+            s[stat::UNQUIET],
+            s[stat::LANDED],
+            mb(s[stat::STAMPED_BYTES]),
+            mb(s[stat::ECHO]),
+            mb(s[stat::ECHO_SENT]),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.
@@ -454,18 +545,71 @@ impl Had {
     }
 }
 
-/// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
-///
-/// This tree's landing writes through the title's own address only (there
-/// is no `crate::inplace::beside` here), and its `watch` keeps no bits of
-/// landed blocks, so there is nothing to note: the type stays so that the
-/// jobs read as they do in the tree this came from.
+/// What a job put into title memory through the title's own address, to be
+/// noted ([`Notes::flush`]).
 #[derive(Default)]
-pub(crate) struct Notes;
+pub(crate) struct Notes {
+    /// The 64 KiB blocks of title memory a piece put bytes into with their
+    /// write watch clean before the stores and reset after them (page
+    /// numbers, as the journal counts them): to be noted at the end of the
+    /// job, after every byte is in and every reset made.
+    pages: Vec<usize>,
+    /// Per such piece, its block and the copy it was landed through (which
+    /// the job holds until the flush). The block is noted once; a second
+    /// entry for it of another copy says two copies landed there, and then
+    /// neither holds the block as it is now.
+    landed: Vec<(usize, *const crate::shadow::Shadow)>,
+}
+
+// SAFETY: the pointers are of copies the job holds until `flush`, which
+// reads them on the thread the job ran on (as in the tree this came from).
+unsafe impl Send for Notes {}
 
 impl Notes {
-    /// At the end of a job: nothing to do here.
-    pub(crate) fn flush(&mut self) {}
+    /// At the end of a job: the blocks it put bytes into with their write
+    /// watch clean and reset are noted, one asking for the job, and each
+    /// block one copy alone landed in is noted current for that copy.
+    ///
+    /// Noted only now, after the bytes are in and the resets are made: a copy
+    /// that read the block before them did so with the number of an asking
+    /// made before that, which is under the one given here, and takes it
+    /// again.
+    pub(crate) fn flush(&mut self) {
+        if self.pages.is_empty() {
+            return;
+        }
+        let noting = std::time::Instant::now();
+        let (now, blocks) = crate::watch::landed_blocks(&self.pages);
+        count(stat::LANDED, blocks.len() as u64);
+        for (block, before) in blocks {
+            // Only where one copy alone landed in the block: with two, each
+            // holds only its own bytes of it and can be noted current for
+            // neither ([`taken`]).
+            let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
+            let Some(copy) = through.next() else {
+                continue;
+            };
+            if !copy.is_null() && through.all(|other| other == copy) {
+                // SAFETY: the job holds its copies until this is done.
+                let copy = unsafe { &*copy };
+                let stamped = copy.landed(block, before, now);
+                count(stat::STAMPED, u64::from(stamped));
+                count(stat::STAMPED_BYTES, if stamped { BLOCK as u64 } else { 0 });
+            }
+        }
+        self.pages.clear();
+        self.landed.clear();
+        spent(stat::NOTES, noting);
+    }
+}
+
+#[cfg(test)]
+impl Notes {
+    /// Whether nothing was put into it: no block to note and no copy to note
+    /// current (the test of a block a landing must leave to the kernel).
+    pub(crate) fn is_empty_for_test(&self) -> bool {
+        self.pages.is_empty() && self.landed.is_empty()
+    }
 }
 
 /// Lands one piece: `parts` (offsets from and to) of the bytes at `now`,
@@ -485,7 +629,6 @@ pub(crate) unsafe fn piece(
     notes: &mut Notes,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
-    let _ = (notes, copy);
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
     };
@@ -510,7 +653,16 @@ pub(crate) unsafe fn piece(
         ((base + first) * PAGE).max(title),
         ((base + last + 1) * PAGE).min(title + end),
     );
+    let block = title / BLOCK;
     let opening = std::time::Instant::now();
+    // Whether the kernel's write watch knows nothing of the block before the
+    // stores below: only then can what they set be told apart from the
+    // title's own writes, reset, and the block noted as ours ([`taken`]).
+    // Asked the way `Shadow::put_back_quiet` asks of its own range.
+    let quiet = taken() && block_clean(block);
+    if taken() && !quiet {
+        count(stat::UNQUIET, 1);
+    }
     // What shaders wrote is about to go into title memory there: its guarded
     // blocks are opened, so the stores below fault nothing, and every copy
     // of those blocks is told they changed.
@@ -566,6 +718,19 @@ pub(crate) unsafe fn piece(
             new_pages += 1;
         }
     });
+    // The bytes are in: the block's write-watch bits, which the stores above
+    // set, are cleared, so that the next asking does not report them as the
+    // title's write (a number above the note made at the end of the job) and
+    // the copy the landing went through is not told to take its own output
+    // again. Only a block that got bytes and lost none is reset and noted: a
+    // reset of one the title wrote to, or that our merge could not finish,
+    // would lose its write for nothing.
+    if quiet && missing == 0 && new_pages > 0 {
+        block_reset(block);
+        count(stat::QUIET, 1);
+        notes.pages.push(block);
+        notes.landed.push((block, copy));
+    }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::NEW_PAGES, new_pages);
     count(stat::NEW_BLOCKS, blocks);
@@ -575,6 +740,51 @@ pub(crate) unsafe fn piece(
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     count(stat::PIECES, 1);
     dwords * 4
+}
+
+/// Whether the kernel's write watch reports nothing written in 64 KiB block
+/// `block` of title memory since its pages were last reset, and the block is
+/// write-watched at all: the check `Shadow::put_back_quiet` makes of its own
+/// range before it stores. False where the kernel cannot answer (view
+/// memory, uncommitted pages, a block across allocations), and then the
+/// block is landed the old way: reset by nobody, reported by the kernel, and
+/// never noted or stamped.
+fn block_clean(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [std::ptr::null_mut::<std::ffi::c_void>(); 32];
+    let mut count = found.len();
+    let mut granularity = 0u32;
+    // SAFETY: a query of title memory into an array of ours (a block is 16
+    // pages of 4 KiB, the unit of the answer).
+    let asked = unsafe {
+        GetWriteWatch(
+            0,
+            (block * BLOCK) as _,
+            BLOCK,
+            found.as_mut_ptr(),
+            &mut count,
+            &mut granularity,
+        )
+    };
+    asked == 0 && count == 0
+}
+
+/// Clears the kernel's write-watch bits of 64 KiB block `block` of title
+/// memory, which the stores of a landing set: what would have reported them
+/// as the title's writes forgets them, and the journal's note, made after the
+/// bytes are in, is what tells every copy.
+///
+/// Only a block [`block_clean`] found write-watched and clean before the
+/// stores is reset.
+///
+/// shortcut: a title write to one of the block's pages between the check and
+/// the reset is lost to the write watch (as `Shadow::put_back_quiet`'s own
+/// doc says of its range; `VICTORY_LAND_TAKEN=0` lands the old way).
+fn block_reset(block: usize) {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    // SAFETY: `block_clean` found the block write-watched and clean before
+    // the stores, and it is title memory this landing was given.
+    unsafe { ResetWriteWatch((block * BLOCK) as _, BLOCK) };
 }
 
 /// `parts` of a piece that begins at `title`, cut where 4 KiB pages of title

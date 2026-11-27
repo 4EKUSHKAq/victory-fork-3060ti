@@ -28,6 +28,19 @@
 //! bit ([`PUBLISHED`]): a range whose blocks all have theirs is answered
 //! from the journal alone, with no lock of the guards and no kernel call
 //! ([`light`]).
+//!
+//! Our own landing writes title memory through the title's own address,
+//! which the kernel's write watch sees as the title's: the blocks it had
+//! clean, whose bits it then resets, are noted as written by us in the
+//! journal ([`landed_blocks`]), whole 64 KiB blocks at a time.
+//!
+//! Port of `watch.rs::landing` and `watch.rs::landed_beside` from
+//! `trustno1-coder/VIctory-NVIDIA` (GPL-3.0-or-later), read at `d12eb1b`
+//! (their watch.rs:1852-1934), functions `watch.rs:1852-1934`,
+//! `shadow.rs:4181-4256`, `land.rs:481-548`; adapted to this tree: a block
+//! the kernel's write watch was clean for before the stores and whose bits
+//! were reset after them is noted whole (no 4 KiB parts, no `LANDED` record,
+//! no `elsewhere` alias pages: nothing here reads them).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -326,6 +339,43 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
         }
     }
     (before, now)
+}
+
+/// Our landing put what shaders wrote into title memory's 64 KiB blocks
+/// `pages` (page numbers, as the journal counts them): noted as written by
+/// us at a new asking, which every host copy that holds them takes at its
+/// next refresh. Noted after the bytes are in and after the write watch's
+/// bits of the blocks were reset, never before: a copy that read a block
+/// before them did so with the number of an asking made before that, which
+/// is under the one given here, and takes it again; noted before, a copy
+/// could read the older bytes with a number above the note's.
+///
+/// `pages` are grouped as the landing's jobs give them: a block repeated at
+/// once (two pieces of a job that landed in it) is noted once. Returns the
+/// note's number and, per block in the order given, the number of the
+/// block's last write before (0: none is known) — the copy that landed
+/// through notes itself current with those ([`crate::shadow::Shadow::landed`]).
+pub(crate) fn landed_blocks(pages: &[usize]) -> (u64, Vec<(usize, u64)>) {
+    let mut blocks: Vec<(usize, u64)> = Vec::with_capacity(pages.len());
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    // As in [`wrote`] and [`wrote_own`]: an asking that stands for a
+    // submission, or for a flush, moves with it, or a copy taking the block
+    // at the standing asking would find it written "later" at every refresh
+    // (fxceless/victory-fork#410).
+    if j.kept || !j.ahead.is_empty() {
+        j.ahead_asked = now;
+    }
+    for &page in pages {
+        if blocks.iter().any(|&(block, _)| block == page) {
+            continue;
+        }
+        let before = j.written.insert(page, now).unwrap_or(0);
+        blocks.push((page, before));
+    }
+    (now, blocks)
 }
 
 /// The asking that last found the 64 KiB page numbered `page` written (0:
@@ -1855,7 +1905,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// address reused by another test's freed view or buffer can otherwise carry
 /// its notes: a "clean" block, an absent hole, a write in the journal).
 #[cfg(test)]
-fn forget_for_test(at: usize, len: usize) {
+pub(crate) fn forget_for_test(at: usize, len: usize) {
     // The journal first, then the guards: the order [`writes_as`] takes them
     // (a test may be asking while another forgets, and the other order
     // would deadlock the two).
@@ -1875,6 +1925,14 @@ fn forget_for_test(at: usize, len: usize) {
     j.written.retain(|&page, _| !pages.contains(&page));
     j.ahead
         .retain(|&(first, last)| !(pages.start <= first && last <= pages.end));
+}
+
+/// The number of the last asking, for tests (`asked` only grows). A test
+/// that checks how many askings a call made takes this before and after it
+/// (the gate runs the tests one at a time: `--test-threads=1`).
+#[cfg(test)]
+pub(crate) fn asked_for_test() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

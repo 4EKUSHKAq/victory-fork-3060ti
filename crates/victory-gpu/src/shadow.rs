@@ -14,9 +14,23 @@
 //! date (vertex and index buffer views, constant buffers in tables, root
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
+//!
+//! A landing put what shaders wrote into title memory and into the copy it
+//! went through by the same merge: a copy in the card's memory that holds
+//! title memory's bytes of the block already must not take its own output
+//! again nor send it up ([`Shadow::landed`], [`Shadow::note_landing`],
+//! [`Shadow::take_landed`]).
+//!
+//! Port of the landed-beside bookkeeping from `trustno1-coder/VIctory-NVIDIA`
+//! (GPL-3.0-or-later), read at `d12eb1b`; functions `watch.rs:1852-1934`,
+//! `shadow.rs:4181-4256`, `land.rs:481-548`; adapted to this tree: a bit is
+//! one whole 64 KiB page (this tree's journal and refresh unit, not 4 KiB),
+//! the compare sits where a refresh copies stale pages (this tree has no
+//! `take`/`runs` to put it in), and the write-watch reset of the landing
+//! takes the place of `watch::block_published`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -35,6 +49,14 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Title memory's 64 KiB pages from `start`'s on, a bit each, that a
+    /// landing put what shaders wrote into ([`Shadow::note_landing`]): the
+    /// next refresh of them compares them with title memory rather than
+    /// copying them and sending them up again ([`Shadow::take_landed`]);
+    /// empty until then.
+    landings: Mutex<Vec<u64>>,
+    /// Whether any is.
+    landing: AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -3059,6 +3081,8 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            landings: Mutex::default(),
+            landing: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -4084,13 +4108,119 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy_run((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy_run((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
+        bytes
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` for a run of stale pages, or for a
+    /// copy in the card's memory with landed pages, [`Shadow::take_landed`].
+    fn copy_run(&self, from: usize, to: usize) -> usize {
+        if from >= to || !self.echo_on() {
+            return self.copy(from, to);
+        }
+        self.take_landed(from, to)
+    }
+
+    /// Whether this refresh compares the pages a landing noted with title
+    /// memory instead of copying them ([`Shadow::take_landed`]).
+    fn echo_on(&self) -> bool {
+        self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo()
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) for a copy in the
+    /// card's memory: a whole 64 KiB page a landing noted
+    /// ([`Shadow::note_landing`]) is read from title memory beside the copy's
+    /// CPU side, and the bytes that are equal are left as they are and not
+    /// sent up ([`ECHO`]): the landing put them into both, so copying them
+    /// again and sending them up would have the card hash them again for
+    /// nothing. A page that differs is copied and noted for the card as
+    /// before; pages not noted, and the parts of pages cut by the range, are
+    /// copied as [`Shadow::copy`] does. Returns the bytes copied.
+    ///
+    /// A noted page is taken as looked at (its bit cleared); a later landing
+    /// notes it again. Noted pages are only whole pages inside the copy: a
+    /// page cut by its start or end, or by the range, would be read or
+    /// written outside what is ours.
+    ///
+    /// Port of `Shadow::take_landed` from `trustno1-coder/VIctory-NVIDIA`
+    /// (GPL-3.0-or-later), read at `d12eb1b` (their shadow.rs:4196-4256);
+    /// adapted to this tree: whole 64 KiB pages instead of 4 KiB ones (this
+    /// tree's journal and refresh unit), and no `known` argument: a page the
+    /// copy never took has no title bytes to keep, and a compare there
+    /// either differs and copies it or coincides, where skipping it is right
+    /// too.
+    fn take_landed(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let base = start / PAGE;
+        // Runs of pages (from, to, noted): as `copy_stale` gives them, whole
+        // pages or the range's cut ends, in page order.
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        {
+            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            let mut at = from;
+            while at < to {
+                let next = ((at / PAGE + 1) * PAGE).min(to);
+                let whole = at % PAGE == 0 && next - at == PAGE;
+                let noted = whole
+                    && bits.get_mut(at / PAGE - base).is_some_and(|word| {
+                        let bit = 1u64 << ((at / PAGE - base) % 64);
+                        let noted = *word & bit != 0;
+                        *word &= !bit;
+                        noted
+                    });
+                match runs.last_mut() {
+                    Some(last) if last.2 == noted => last.1 = next,
+                    _ => runs.push((at, next, noted)),
+                }
+                at = next;
+            }
+        }
+        let mut bytes = 0;
+        TITLE.with_borrow_mut(|title| {
+            for (from, to, noted) in runs {
+                if !noted {
+                    bytes += self.copy(from, to);
+                    continue;
+                }
+                let n = to - from;
+                if title.len() < n {
+                    title.resize(n, 0);
+                }
+                if !crate::host::read_into(from as *const u8, &mut title[..n]) {
+                    // Title memory is not there: copied the old way, which
+                    // counts what could not be read as failed.
+                    bytes += self.copy(from, to);
+                    continue;
+                }
+                // SAFETY: the pages lie whole inside the copy's mapping.
+                let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
+                let stretches = changed_chunks(&title[..n], held, COPY_CHANGED_CHUNK);
+                let mut sent = 0;
+                for &(at, len) in &stretches {
+                    // SAFETY: as above; the stretch lies inside both.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(title.as_ptr().add(at), self.data.add(from - start + at), len)
+                    };
+                    // After the bytes are in: a snapshot taken meanwhile is
+                    // not current.
+                    self.changed(from - start + at, from - start + at + len);
+                    self.card_changed(from - start + at, from - start + at + len);
+                    sent += len;
+                }
+                crate::land::count(crate::land::stat::ECHO, (n - sent) as u64);
+                crate::land::count(crate::land::stat::ECHO_SENT, sent as u64);
+                bytes += sent;
+            }
+        });
         bytes
     }
 
@@ -4448,6 +4578,20 @@ pub(crate) fn exact_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_BACK").is_none_or(|v| v != "0"))
 }
 
+/// Whether a copy in the card's memory whose refresh reaches pages a landing
+/// noted compares them with title memory first and sends only what differs
+/// ([`Shadow::take_landed`]); `VICTORY_LAND_ECHO=0` turns it off, and
+/// nothing of it is done without [`crate::land::taken`] (the
+/// Round-19-equivalent arm).
+///
+/// Port of `shadow::land_echo` from `trustno1-coder/VIctory-NVIDIA`
+/// (GPL-3.0-or-later), read at `d12eb1b`; adapted to this tree: the same
+/// `VICTORY_*` variable name read the way this tree reads its switches, and
+/// the `VICTORY_LAND_TAKEN` gate added.
+fn land_echo() -> bool {
+    crate::land::echo_on()
+}
+
 /// Since the last frame-rate line: pieces put back by a landing, the writes
 /// they took, the bytes written, and the pieces whose runs were joined over
 /// bytes that had not changed.
@@ -4558,14 +4702,70 @@ impl Shadow {
         }
     }
 
-    /// What shaders wrote in 64 KiB block `block` (of title memory) of this
-    /// copy was put into title memory. This tree's refresh has no
-    /// landed-block bits and no `crate::watch::block_published` to ask
-    /// before taking a block, so the note is kept as a place and nothing is
-    /// written (the next refresh takes the block again, as before the
-    /// landing).
+    /// What shaders wrote in `[from, to)` (offsets in the copy) of a copy in
+    /// the card's memory was put into title memory by a landing
+    /// ([`crate::land::piece`] through [`Shadow::land_card`]): the next
+    /// refresh compares those 64 KiB pages with title memory instead of
+    /// copying them and sending them up ([`Shadow::take_landed`]).
+    ///
+    /// Port of `Shadow::note_landing` from `trustno1-coder/VIctory-NVIDIA`
+    /// (GPL-3.0-or-later), read at `d12eb1b` (their shadow.rs:4181-4194);
+    /// adapted to this tree: a bit is one whole 64 KiB page (this tree's
+    /// journal unit), and nothing is noted without [`crate::land::taken`]
+    /// (the Round-19-equivalent arm makes no compare at all).
     fn note_landing(&self, from: usize, to: usize) {
-        let _ = (from, to);
+        if !crate::land::taken() {
+            return;
+        }
+        let first = self.start as usize / PAGE;
+        let start = self.start as usize;
+        let pages = (start + from) / PAGE - first..(start + to).div_ceil(PAGE) - first;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            let all = (self.start + self.len).div_ceil(PAGE as u64) as usize - first;
+            bits.resize(all.div_ceil(64), 0);
+        }
+        for page in pages {
+            bits[page / 64] |= 1 << (page % 64);
+        }
+        self.landing.store(true, Ordering::Release);
+    }
+
+    /// What shaders wrote in 64 KiB block `block` (of title memory) of this
+    /// copy was put into title memory by a landing, which was noted as a
+    /// write with number `now`; `before` was the number of the block's last
+    /// write before. If the copy held title memory's bytes of the block
+    /// ahead of that, it holds them still, and is noted current; whether it
+    /// was.
+    ///
+    /// That it does: the landing put the same bytes into the copy and into
+    /// title memory ([`crate::land::piece`]'s merge does both), and
+    /// [`crate::land::Notes::flush`] calls this only for a block whose write
+    /// watch was clean before the merge, whose bits were reset after it, no
+    /// page of which was missing, and in which one copy alone landed. A
+    /// write of the title's after the note has a number above it and every
+    /// copy takes the block again; one before it has a number the copy took
+    /// the block after (the `*at >= before` below), or it takes the block
+    /// again.
+    ///
+    /// Port of `Shadow::landed` from `trustno1-coder/VIctory-NVIDIA`
+    /// (GPL-3.0-or-later), read at `d12eb1b` (their shadow.rs:4782-4806);
+    /// adapted to this tree: `crate::watch::block_published` is not asked
+    /// (it is false after our own guard opening, and the write-watch reset
+    /// is the landing's own word that the block was clean).
+    pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+        let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
+            return false;
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = copied.get_mut(page) else {
+            return false;
+        };
+        let held = *at != 0 && *at >= before;
+        if held {
+            *at = (*at).max(now);
+        }
+        held
     }
 }
 
@@ -5694,6 +5894,54 @@ mod land_tests {
         Some(shadow)
     }
 
+    /// Committed, write-watched memory, as the runtime makes the title memory
+    /// [`crate::watch`] asks the kernel about (a landing resets the bits of
+    /// what it wrote, [`crate::land::piece`]): reserved with write watching
+    /// and committed in a second call, as the runtime's `xmem` does.
+    fn watched(len: usize) -> usize {
+        use windows_sys::Win32::System::Memory as mem;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh reservation and commit of ours.
+        unsafe {
+            let at = mem::VirtualAlloc(
+                std::ptr::null(),
+                len,
+                mem::MEM_RESERVE | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            );
+            assert!(!at.is_null());
+            let committed = mem::VirtualAlloc(at, len, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert_eq!(committed, at);
+            at as usize
+        }
+    }
+
+    /// [`watched`]'s allocations are freed here.
+    fn freed(at: usize) {
+        // SAFETY: our allocation.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(at as _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+    }
+
+    /// The title's pages written once and their write-watch bits cleared, as
+    /// the title leaves memory it uses: the first touch of a committed page
+    /// of write-watched memory is marked written by this kernel as well, so
+    /// a test that wants a block clean before a landing makes it resident
+    /// first.
+    fn touch(title: usize, len: usize) {
+        // SAFETY: the title allocation, `len` bytes.
+        unsafe { std::ptr::write_bytes(title as *mut u8, 0, len) };
+        let _ = crate::watch::writes(title, title + len, true);
+    }
+
+    /// A copy of title memory at `title` in the PC's memory, all bytes 0
+    /// (the title's, as the tests leave it).
+    fn plain_copy(title: usize, len: usize) -> Option<Shadow> {
+        let (buffer, data) = crate::host::host()?.shared_buffer(len as u64)?;
+        // SAFETY: the mapping, `len` bytes.
+        unsafe { std::ptr::write_bytes(data, 0, len) };
+        Some(Shadow::new(buffer, data, 0, title as u64, len as u64))
+    }
+
     /// Memory that stays (`crate::watch` knows its addresses): private, or a
     /// view noted as the runtime notes the title's.
     fn memory(len: usize, view: bool) -> usize {
@@ -5781,5 +6029,147 @@ mod land_tests {
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
             }
         }
+    }
+
+    /// A landing that went through a copy is noted for that copy: its next
+    /// refresh copies none of the block, another copy of the same title
+    /// memory takes it, and a write of the title's after the landing makes
+    /// even the first take it again.
+    ///
+    /// Port of the landed-block parts of `mod land_tests` from
+    /// `trustno1-coder/VIctory-NVIDIA` (GPL-3.0-or-later), read at
+    /// `d12eb1b`; adapted to this tree: whole 64 KiB blocks (this tree's
+    /// journal and refresh unit), a title memory written through its own
+    /// address with the write watch reset, and no beside-the-guards path.
+    #[test]
+    fn a_landing_the_copy_went_through_is_not_copied_again() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = crate::watch::PAGE;
+        let title = watched(LEN);
+        touch(title, LEN);
+        crate::watch::forget_for_test(title, LEN);
+        let (Some(one), Some(two)) = (plain_copy(title, LEN), plain_copy(title, LEN)) else {
+            return; // no host GPU
+        };
+        // Both copies take the block first: they are current as of the
+        // asking those refreshes make.
+        assert_eq!(one.update_free(title, title + LEN), LEN);
+        assert_eq!(two.update_free(title, title + LEN), LEN);
+        // The card wrote 0x5a: the landing puts it into title memory and into
+        // the copy it goes through, resets the block's write watch, and the
+        // job notes the block.
+        let now = vec![0x5a; LEN];
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: the fetched bytes are `now`'s, and the copy's side is its
+        // mapping; the title allocation is `LEN` bytes.
+        let put = unsafe {
+            crate::land::piece(title, now.as_ptr(), one.data as *mut u8, &[(0, LEN)], true, &mut notes, &one)
+        };
+        assert!(put > 0, "the landing put nothing");
+        notes.flush();
+        // The copy the landing went through holds what it put: its next
+        // refresh copies none of it.
+        assert_eq!(one.update_free(title, title + LEN), 0, "the through copy took its own output again");
+        // A copy that did not land it does not hold it.
+        assert!(two.update_free(title, title + LEN) > 0, "another copy did not take the landed block");
+        // A write of the title's after the landing: the copy takes the block
+        // again (the kernel reports it above the note).
+        // SAFETY: inside the title allocation.
+        unsafe { (title as *mut u8).add(17).write(0x77) };
+        assert!(one.update_free(title, title + LEN) > 0, "a title write after the landing was not taken");
+        crate::watch::forget_for_test(title, LEN);
+        freed(title);
+    }
+
+    /// A block the kernel's write watch was not clean for before the merge is
+    /// left to the kernel: no note is made for it, the copy is not stamped,
+    /// and the next refresh copies the block again.
+    #[test]
+    fn a_block_the_title_wrote_before_the_landing_is_never_stamped() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = crate::watch::PAGE;
+        let title = watched(LEN);
+        touch(title, LEN);
+        crate::watch::forget_for_test(title, LEN);
+        let Some(one) = plain_copy(title, LEN) else {
+            return; // no host GPU
+        };
+        assert_eq!(one.update_free(title, title + LEN), LEN);
+        let copied = *one.copied.lock().unwrap().first().unwrap();
+        assert_ne!(copied, 0, "the copy did not take the block");
+        // A write of the title's to the block before the landing: the
+        // kernel's bit for it stands, so the landing's check finds the block
+        // unclean and leaves it to the kernel.
+        // SAFETY: inside the title allocation.
+        unsafe { (title as *mut u8).add(5).write(0x11) };
+        let now = vec![0x5a; LEN];
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: as above.
+        let put = unsafe {
+            crate::land::piece(title, now.as_ptr(), one.data as *mut u8, &[(0, LEN)], true, &mut notes, &one)
+        };
+        assert!(put > 0, "the landing put nothing");
+        assert!(notes.is_empty_for_test(), "a block the title wrote to was noted");
+        notes.flush();
+        assert_eq!(*one.copied.lock().unwrap().first().unwrap(), copied, "the block was stamped anyway");
+        assert!(one.update_free(title, title + LEN) > 0, "the next refresh did not copy the block again");
+        crate::watch::forget_for_test(title, LEN);
+        freed(title);
+    }
+
+    /// A copy in the card's memory that holds what a landing put into title
+    /// memory sends none of it up: the refresh compares the page the landing
+    /// noted with title memory and leaves equal bytes as they are; a page the
+    /// title changed after the landing is copied and sent, as before.
+    ///
+    /// The test of `Shadow::take_landed` (a port of
+    /// `trustno1-coder/VIctory-NVIDIA`'s, GPL-3.0-or-later, read at
+    /// `d12eb1b`), adapted to this tree: whole 64 KiB pages and no `known`
+    /// argument.
+    #[test]
+    fn a_landed_page_the_card_copy_holds_is_not_sent_again() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = crate::watch::PAGE;
+        let title = watched(LEN);
+        touch(title, LEN);
+        crate::watch::forget_for_test(title, LEN);
+        let (Some(one), Some(two)) = (copy_of(title, LEN), copy_of(title, LEN)) else {
+            return; // no host GPU
+        };
+        // Both copies take the block (the title's zeroes).
+        assert_eq!(one.update_free(title, title + LEN), LEN);
+        assert_eq!(two.update_free(title, title + LEN), LEN);
+        for shadow in [&one, &two] {
+            shadow.card.as_ref().expect("made with one").dirty.lock().unwrap().clear();
+        }
+        // The card wrote 0x5a and both copies land it in the block: neither is
+        // stamped current (two copies landed there), but both hold its bytes.
+        let now = vec![0x5a; LEN];
+        let mut notes = crate::land::Notes::default();
+        let addressed: Vec<(usize, usize, usize)> = vec![(0, LEN, now.as_ptr() as usize)];
+        // SAFETY: the fetched bytes are `now`'s, which stays as it is.
+        unsafe {
+            one.land_card(&addressed, 0, &mut notes);
+            two.land_card(&addressed, 0, &mut notes);
+        }
+        notes.flush();
+        // Noted for the copy that holds its bytes: the refresh compares and
+        // sends nothing.
+        assert_eq!(one.update_free(title, title + LEN), 0, "a landed page the copy holds was sent up");
+        assert!(
+            one.card.as_ref().expect("made with one").dirty.lock().unwrap().is_empty(),
+            "a landed page the copy holds was noted for the card"
+        );
+        // A write of the title's after the landing: the page differs and is
+        // copied and sent whole, as before.
+        // SAFETY: inside the title allocation.
+        unsafe { (title as *mut u8).add(23).write(0x77) };
+        assert_eq!(one.update_free(title, title + LEN), LEN, "a changed page was not copied");
+        assert!(
+            !one.card.as_ref().expect("made with one").dirty.lock().unwrap().is_empty(),
+            "a changed page was not noted for the card"
+        );
+        crate::watch::forget_for_test(title, LEN);
+        freed(title);
     }
 }

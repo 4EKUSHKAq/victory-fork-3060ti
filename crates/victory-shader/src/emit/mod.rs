@@ -104,6 +104,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_append;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -336,7 +337,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -348,6 +349,14 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // Round 18, trustno1-coder/VIctory-NVIDIA PR #45 (GPL-3.0-or-later): on a
+    // host of 32-lane waves the transmission tile allocator reserves slots
+    // twice the wave-wide way and leaves whole tiles of open water dark. The
+    // console program is patched before lowering; on any mismatch it is
+    // refused and this shader keeps the lowering it had.
+    if lower::host_max_wave() == 32 && c.digest == water_tile_append::CONTAINER_ID {
+        water_tile_append::rewrite(&mut native)?;
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

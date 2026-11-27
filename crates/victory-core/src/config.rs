@@ -129,10 +129,13 @@ impl Config {
     }
 }
 
-/// The shader cache the builds from Round 8 on read and write: the
-/// translator changed (`crates/victory-shader`), so a new directory is
-/// started rather than mixing the old entries (which stay where they are).
-const SHADER_CACHE_REVISION: &str = "r8-group2";
+/// The shader cache the builds from Round 18 on read and write: the
+/// translator changed (`crates/victory-shader`: the transmission tile
+/// allocator is lowered for 32-lane hosts, trustno1-coder/VIctory-NVIDIA
+/// PR #45), so a new directory is started rather than mixing the old entries
+/// (which stay where they are: `shaders-r8-group2` is the rollback, named
+/// with `VICTORY_SHADER_CACHE_REVISION=r8-group2`).
+const SHADER_CACHE_REVISION: &str = "r18-water32";
 
 /// The directory name [`Config::shader_cache_subdir`] uses: the revision
 /// after `shaders-`, or the old `shaders` for a rollback (`0`, empty).

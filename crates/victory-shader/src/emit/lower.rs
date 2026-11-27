@@ -1088,6 +1088,21 @@ pub(super) fn host_max_wave() -> u32 {
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
     }
+    // A run sets it from the device; the offline translator (`translate
+    // --cache`, `translate --warm`) has no device, so `VICTORY_HOST_WAVE`
+    // names the host's wave there (the same switch their `victory shaders`
+    // documents: 32 on every NVIDIA GPU, left out on AMD).
+    static FROM_ENV: std::sync::Once = std::sync::Once::new();
+    FROM_ENV.call_once(|| {
+        if HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return;
+        }
+        if let Some(lanes) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.trim().parse::<u32>().ok())
+            && lanes != 0
+        {
+            HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 

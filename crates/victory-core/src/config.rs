@@ -1,4 +1,4 @@
-//! Where the user's files live.
+﻿//! Where the user's files live.
 //!
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
@@ -228,11 +228,11 @@ mod tests {
 
     #[test]
     fn the_shader_cache_directory_carries_the_revision() {
-        assert_eq!(shader_cache_dir_name(None), "shaders-r8-group2");
+        assert_eq!(shader_cache_dir_name(None), "shaders-r18-water32");
         assert_eq!(shader_cache_dir_name(Some("")), "shaders");
         assert_eq!(shader_cache_dir_name(Some("0")), "shaders");
         assert_eq!(shader_cache_dir_name(Some("try-2")), "shaders-try-2");
-        assert_eq!(shader_cache_dir_name(Some("../x")), "shaders-r8-group2");
+        assert_eq!(shader_cache_dir_name(Some("../x")), "shaders-r18-water32");
     }
 
     #[test]

@@ -1827,7 +1827,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept(memory)
                 < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
@@ -1837,7 +1837,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// before; the default itself is 3 GiB capped at a quarter of the card's
+/// budget, [`targets_room_most`]) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1862,15 +1863,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// for targets against a line of 9,527 MB). The reserve comes back when
 /// the targets grow by 64 MiB again (a new scene's), for as long again.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(memory: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let most = targets_room_most(memory.map(|[budget, ..]| budget), asked);
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
@@ -1919,6 +1920,27 @@ fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
     }
 }
 
+/// The reserve [`targets_room_kept`] keeps: the switch's megabytes when it
+/// names any, else 3 GiB capped at a quarter of the card's budget (ported
+/// from 101Leafy/victory-leafy PR #26, "the card memory this port keeps
+/// follows the card's budget", GPL-3.0-or-later; the same tuning was measured
+/// on this fork's RTX 3060 Ti 8 GB in Rounds 13-20).
+///
+/// A reserve is a share of a card, not a number of gigabytes. The figured
+/// 3 GiB was measured on a 24 GiB card, an eighth; on an 8 GiB RTX 3060 Ti
+/// the same 3 GiB is more than a third, held out of the texture queue's reach
+/// for targets that may never need it: the queue then stops uploading while
+/// the title's textures have nowhere to go. A quarter of the budget is 3 GiB
+/// at 12 GiB and up, so nothing measured there moves; an 8 GiB card keeps
+/// about 1.8-2.0 GB instead.
+#[cfg(any(windows, test))]
+fn targets_room_most(budget: Option<u64>, asked: Option<u64>) -> u64 {
+    if let Some(mb) = asked {
+        return mb.min(8192) << 20;
+    }
+    (3072 << 20).min(budget.map_or(u64::MAX, |budget| budget / 4))
+}
+
 /// What [`room`] weighs now, in MB, for the log: the card's budget, its
 /// use, the free part of the texture blocks, what is kept for card copies
 /// of title buffers and for render targets, and the line. `None` without
@@ -1929,14 +1951,15 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
     if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return None;
     }
-    let [budget, used, ..] = memory?;
+    let memory = memory?;
+    let [budget, used, ..] = memory;
     Some(
         [
             budget,
             used,
             crate::pool::texture_room(),
             crate::shadow::card_room_kept(),
-            targets_room_kept(),
+            targets_room_kept(Some(memory)),
             room_line(budget),
         ]
         .map(|bytes| bytes >> 20),
@@ -1963,34 +1986,70 @@ pub(crate) fn room_lately() -> bool {
 
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97), or 94 on a card of
+/// 8 GiB or less ([`default_texture_room_percent`]). At 90 about a tenth of
+/// the budget, 1,020 MB of 10,200, stays unused while thousands of textures
+/// wait (runs 170-174); the card copies of title buffers from 1 MiB up take
+/// 449 MB more of the card than before (941 against 492), and 94 gives the
+/// textures about that much back.
 ///
-/// Unless that switch is set the line is [`line_for`] the budget instead.
+/// Unless that switch is set the line is [`line_for`] the budget instead,
+/// except on those small cards ([`room_line`]).
 #[cfg(windows)]
 pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+        if let Some(percent) = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        {
+            return percent.clamp(50, 97);
+        }
+        let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        default_texture_room_percent(budget)
     })
+}
+
+/// The default [`room_percent`] for a host whose budget is `budget` bytes:
+/// 94 on cards of 8 GiB or less, 90 everywhere else (and before the host is
+/// up, when the budget is not known).
+///
+/// An 8 GiB card such as the RTX 3060 Ti reports about 7.1-7.6 GiB of budget;
+/// the flat 10 % reserve of the 90 % policy leaves 700-760 MB unused there,
+/// while the card copies of title buffers take about that much back (the same
+/// measurement as `room_percent`'s doc). Larger cards keep the long-tested
+/// 90 % policy, which is what their line was measured on.
+#[cfg(any(windows, test))]
+fn default_texture_room_percent(budget: Option<u64>) -> u64 {
+    budget
+        .filter(|&bytes| bytes != 0 && bytes <= 8 * (1024u64 << 20))
+        .map_or(90, |_| 94)
 }
 
 /// The line [`room`] weighs the card's use against, in bytes of a budget
 /// of `budget`: `VICTORY_TEXTURE_ROOM_PERCENT`'s share of it if set, else
-/// [`line_for`] it.
+/// [`line_for`] it, except on a card of 8 GiB or less, where the 94 % the
+/// 8 GiB tuning asks for is more than `line_for` gives ([`small_card_line`]).
 #[cfg(windows)]
 pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else {
-        line_for(budget)
+        small_card_line(budget)
+    }
+}
+
+/// [`room_line`] without `VICTORY_TEXTURE_ROOM_PERCENT`: [`line_for`] the
+/// budget, except on a card of 8 GiB or less, where `line_for` leaves about
+/// a tenth of it free and the 8 GiB tuning wants 94 % of the budget for the
+/// textures (the reserve seen on new textures' "no room" at 6.3-6.7 GiB of
+/// a 7.1-7.6 GiB budget).
+#[cfg(any(windows, test))]
+fn small_card_line(budget: u64) -> u64 {
+    match default_texture_room_percent(Some(budget)) {
+        90 => line_for(budget),
+        percent => budget / 100 * percent,
     }
 }
 
@@ -2273,7 +2332,7 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept(memory);
             crate::host::vram_keep_below(budget, used, room_line(budget))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4825,6 +4884,40 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    /// The default room share is 94 on a card of 8 GiB or less (the RTX
+    /// 3060 Ti tuning), 90 elsewhere; the line follows it on those cards.
+    #[test]
+    fn default_texture_room_percent_is_94_on_small_cards() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_texture_room_percent(Some(6 * GIB)), 94);
+        assert_eq!(default_texture_room_percent(Some(8 * GIB)), 94);
+        assert_eq!(default_texture_room_percent(Some(9 * GIB)), 90);
+        assert_eq!(default_texture_room_percent(Some(12 * GIB)), 90);
+        assert_eq!(default_texture_room_percent(Some(0)), 90);
+        assert_eq!(default_texture_room_percent(None), 90);
+        // 94 % of a 7.1-7.6 GiB budget is more than line_for leaves free.
+        assert_eq!(small_card_line(8 * GIB), 8 * GIB / 100 * 94);
+        assert!(small_card_line(8 * GIB) > line_for(8 * GIB));
+        // Larger cards keep line_for.
+        assert_eq!(small_card_line(24 * GIB), line_for(24 * GIB));
+        assert_eq!(small_card_line(0), 0);
+    }
+
+    /// The reserve kept for render targets is a quarter of a small card's
+    /// budget, not the flat 3 GiB a 12 GiB and larger card has room for.
+    #[test]
+    fn room_for_targets_follows_the_card_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(targets_room_most(None, None), 3072 << 20);
+        assert_eq!(targets_room_most(Some(24 * GIB), None), 3072 << 20);
+        assert_eq!(targets_room_most(Some(12 * GIB), None), 3072 << 20);
+        assert_eq!(targets_room_most(Some(8 * GIB), None), 2 * GIB);
+        assert_eq!(targets_room_most(Some(4 * GIB), None), 1 * GIB);
+        // The switch wins: megabytes, capped at 8 GiB.
+        assert_eq!(targets_room_most(Some(8 * GIB), Some(500)), 500 << 20);
+        assert_eq!(targets_room_most(Some(8 * GIB), Some(16_384)), 8192 << 20);
     }
 
     /// The room kept for render targets goes once the world's targets are

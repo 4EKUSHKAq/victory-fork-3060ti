@@ -42,6 +42,13 @@ const PROGRAM_ID: u64 = 0x377a_8d97_4fb8_631f;
 /// The program's size in bytes, before anything is written.
 const PROGRAM_BYTES: usize = 2112;
 
+/// FNV-1a of a console program's code, the identity [`rewrite`] checks.
+fn fingerprint(code: &[u8]) -> u64 {
+    code.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 /// Whether `native` is the program [`CONTAINER_ID`] names, and if so, lower
 /// its two tile-list allocations for a host of 32-lane waves.
 pub(super) fn rewrite(native: &mut NativeProgram) -> Result<(), ShaderError> {
@@ -49,10 +56,7 @@ pub(super) fn rewrite(native: &mut NativeProgram) -> Result<(), ShaderError> {
         return Err(ShaderError::Malformed("unexpected transmission tile program"));
     }
     let code = &mut native.code;
-    let fingerprint = code.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    });
-    if fingerprint != PROGRAM_ID {
+    if fingerprint(code) != PROGRAM_ID {
         return Err(ShaderError::Malformed("unexpected transmission tile program body"));
     }
 
@@ -112,5 +116,44 @@ mod tests {
         assert!(rewrite(&mut program).is_err(), "an all-zero body is not the program");
         program.code.pop();
         assert!(rewrite(&mut program).is_err(), "another size is not the program");
+    }
+
+    /// Diagnostic (`VICTORY_WATER_PROBE_DIR` set to a directory of containers
+    /// dumped by `translate`'s `VICTORY_DUMP_MATCH`): print each container's
+    /// digest and every compute program's identity, so a byte patch can be
+    /// checked against all the containers that carry a water program.
+    /// `cargo test -p victory-shader --lib probe_water_containers -- --nocapture`
+    #[test]
+    fn probe_water_containers() {
+        use super::*;
+        let Some(dir) = std::env::var_os("VICTORY_WATER_PROBE_DIR") else {
+            return;
+        };
+        for entry in std::fs::read_dir(&dir).expect("the probe directory") {
+            let path = entry.expect("an entry").path();
+            let bytes = std::fs::read(&path).expect("a container");
+            let Ok(container) = crate::dxbc::Container::parse(&bytes) else {
+                eprintln!("{}: not a container", path.display());
+                continue;
+            };
+            let digest: String = container.digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            let Some(dxil) = container.part(crate::dxbc::FourCC::DXIL) else {
+                eprintln!("{} digest={digest}: no DXIL part", path.display());
+                continue;
+            };
+            let Ok(programs) = crate::native_programs(dxil.data) else {
+                continue;
+            };
+            for p in programs.iter().filter(|p| p.stage == HwStage::Cs) {
+                eprintln!(
+                    "{} digest={digest} wave64={} len={} fnv={:016x} patch_digest={}",
+                    path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                    p.wave64,
+                    p.code.len(),
+                    fingerprint(&p.code),
+                    container.digest == CONTAINER_ID
+                );
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-﻿//! Where the user's files live.
+//! Where the user's files live.
 //!
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.

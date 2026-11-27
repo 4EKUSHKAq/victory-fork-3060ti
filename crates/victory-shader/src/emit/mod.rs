@@ -349,11 +349,36 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // Debugging aid: with `VICTORY_DEBUG_WATER_TILE` set, print every
+    // container that carries a water entry point with the identity a byte
+    // patch would have to know; `=dump` also writes the program's code to
+    // `C:\GTA6_Port\audit\round18\water-<digest>.bin` (nothing is written
+    // without the switch).
+    if let Some(asked) = std::env::var_os("VICTORY_DEBUG_WATER_TILE") {
+        let names: [&[u8]; 2] = [b"TransmissionVolumetrics", b"Tiled_LocalLights"];
+        if names.iter().any(|name| container.windows(name.len()).any(|w| w == *name)) {
+            let digest: String = c.digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            let fingerprint = native.code.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+            eprintln!(
+                "water-probe: digest={digest} stage={:?} wave64={} len={} fnv={fingerprint:016x} patch_digest={}",
+                native.stage,
+                native.wave64,
+                native.code.len(),
+                c.digest == water_tile_append::CONTAINER_ID
+            );
+            if asked == "dump" {
+                let path = format!("C:\\GTA6_Port\\audit\\round18\\water-{digest}.bin");
+                let _ = std::fs::write(&path, &native.code);
+            }
+        }
+    }
     // Round 18, trustno1-coder/VIctory-NVIDIA PR #45 (GPL-3.0-or-later): on a
     // host of 32-lane waves the transmission tile allocator reserves slots
     // twice the wave-wide way and leaves whole tiles of open water dark. The
     // console program is patched before lowering; on any mismatch it is
-    // refused and this shader keeps the lowering it had.
+    // refused and this shader does not translate.
     if lower::host_max_wave() == 32 && c.digest == water_tile_append::CONTAINER_ID {
         water_tile_append::rewrite(&mut native)?;
         // Whether the patch found its program: `translate --cache` with

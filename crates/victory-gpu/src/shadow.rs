@@ -71,6 +71,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// `buffer` is in the card's memory that the CPU maps
+    /// ([`rebar_copies`]): `data` is written, never read, on the CPU.
+    rebar: bool,
     /// A window whose one buffer is in a GPU upload heap ([`window_upload`]):
     /// its bytes, counted with the windows on the card.
     uploaded: u64,
@@ -490,6 +493,40 @@ fn window_card_room(size: u64, how: &str) -> bool {
     }
     say(0, how);
     true
+}
+
+/// The most bytes of host copies in the card's memory that the CPU maps
+/// (`VICTORY_REBAR_COPIES_MB`; **0 by default: none**, every such copy in the
+/// PC's memory as before; 256 is the value recommended for an 8 GB card).
+///
+/// Textures share the card with them: a copy is made only while a tenth of
+/// the card's budget and the room kept for big copies and render targets stay
+/// free ([`Host::rebar_copy`]). The copies of title memory that shaders only
+/// read (the title's own vertices, indices and constants in windows outside
+/// buffers, and the buffers the title made without unordered access) were in
+/// the PC's memory, and every draw read them over the bus; in a GPU upload
+/// heap the CPU writes the title's bytes straight into the card's memory and
+/// shaders read them at the card's speed: one buffer, no second side, no copy
+/// up before the submission. Never read on the CPU (some 30 MB/s): a copy a
+/// shader is declared to write is still correct, but its snapshot and
+/// copy-back read that memory slowly ([`REBAR_READS`]).
+pub(crate) fn rebar_copies() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_REBAR_COPIES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(12288) << 20
+    })
+}
+
+/// Copies in CPU-visible card memory made, and those a shader was declared
+/// to write (their CPU side is then read: slowly), since the start.
+pub(crate) static REBAR_READS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A buffer of `size` bytes in the card's memory that the CPU maps, for a
+/// copy shaders only read ([`rebar_copies`]), if there is room.
+fn rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let made = host()?.rebar_copy(size, rebar_copies())?;
+    REBAR_READS[0].fetch_add(1, Ordering::Relaxed);
+    Some(made)
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
@@ -2812,6 +2849,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            rebar: false,
             uploaded: 0,
             place: None,
         }
@@ -2857,6 +2895,17 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
+        }
+        if self.rebar {
+            let n = REBAR_READS[1].fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_power_of_two() {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    so_far = n,
+                    "a shader writes a host copy in CPU-visible card memory: its snapshot and copy-back read that memory, slowly"
+                );
+            }
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4124,6 +4173,10 @@ impl Shadow {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// The title made this buffer without unordered access: shaders only read
+    /// it, so a host copy may live in the card's memory the CPU maps
+    /// ([`rebar_copies`]).
+    read_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -4133,14 +4186,24 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title buffer exists at `start` (`len` bytes).
+/// A title buffer exists at `start` (`len` bytes), made without unordered
+/// access by default as the tests register it.
+#[cfg(test)]
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_buffer(resource, start, len, false);
+}
+
+/// A title buffer exists at `start` (`len` bytes); `read_only` when the title
+/// made it without unordered access (shaders only read it), which lets its
+/// host copy live in the card's memory the CPU maps ([`rebar_copies`]).
+pub(crate) fn register_buffer(resource: usize, start: u64, len: u64, read_only: bool) {
     let mut map = buffers();
     map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            read_only,
         },
     );
     // After the insert, with the table's lock still held ([`TABLES_CHANGED`];
@@ -4443,6 +4506,19 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Shaders only read it (the title made it without unordered access):
+        // in the card's memory the CPU maps, whatever its size, if there is
+        // room ([`rebar_copies`]). One buffer: no second side to send up,
+        // nothing to compare.
+        if entry.read_only && let Some((buffer, data)) = rebar_for(size) {
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} in CPU-visible card memory", key.0));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.rebar = true;
+            entry.shadow = Some(Arc::new(shadow));
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -4710,6 +4786,21 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.uploaded = len;
+        let shadow = Arc::new(shadow);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        tables_changed();
+        return Some(shadow);
+    }
+    // Shaders read windows and do not write them: in the card's memory the
+    // CPU maps, if there is room ([`rebar_copies`]).
+    if let Some((buffer, data)) = rebar_for(len) {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in CPU-visible card memory"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.rebar = true;
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());

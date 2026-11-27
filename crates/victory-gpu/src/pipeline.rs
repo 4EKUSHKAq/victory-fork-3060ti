@@ -488,10 +488,29 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_NO_DRAWS=1`: no host pipeline is made and no shader is
+/// translated; every draw and dispatch of the title is dropped. The title
+/// runs as before (its code, streaming, memory) and the picture stays
+/// black: the frame time then is the title's own code and our system
+/// services, the ceiling no graphics work can raise. After the switch of
+/// the same name in Cold Project VI (GPL-3.0), which measured 42-53 ms a
+/// frame that way. Diagnostic only: off by default.
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -607,7 +626,13 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    {
+        // VICTORY_NO_DRAWS=1: nothing of the title is made or drawn (the
+        // pipeline object is still handed out, so the title runs as before).
+        if !no_draws() {
+            make::early(&host);
+        }
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -991,6 +1016,102 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// Exercises the title's dispatch and indirect dispatch with a small
+    /// pretranslated shader. The clamp installs its own compute signature
+    /// before the indirect dispatch must restore the title's arguments.
+    #[cfg(windows)]
+    #[test]
+    fn repeated_root_bindings_reach_direct_and_indirect_dispatches() {
+        use victory_shader::emit::{HostShader, UserData};
+        use victory_shader::{HwStage, RootType};
+        use windows::core::s;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(device) = crate::host::host() else { return };
+        let cs = r#"
+            cbuffer Args : register(b0, space0) { uint at; uint addend; };
+            RWByteAddressBuffer output : register(u1, space1);
+            [numthreads(1, 1, 1)]
+            void main() { uint before; output.InterlockedAdd(at, addend, before); }
+        "#;
+        let dxil = crate::host::compile(cs, s!("main"), s!("cs_5_1")).expect("compute shader");
+        let host_shader = HostShader {
+            stage: HwStage::Cs, dxil,
+            user_data: (0..2).map(|i| UserData { index: i, slot: 0, root: RootType::Constants, dword: i }).collect(),
+            root_uavs: vec![1], root_cbvs: vec![], root_srvs: vec![],
+            root_indexed_views: vec![], samplers: vec![], static_samplers: vec![],
+        };
+        let shader = Arc::new(Shader {
+            hash: "root binding test".into(), stage: "compute", container: Vec::new(),
+            #[cfg(windows)]
+            ambient: None,
+            translated: OnceLock::from(Some(Translated { host: host_shader, used: vec![], stores: true })),
+            #[cfg(windows)]
+            walks: OnceLock::new(),
+        });
+        let mut pipe = std::ptr::null();
+        assert_eq!(hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut pipe), S_OK);
+        assert!(make::now(&pipeline(pipe).host), "translated compute pipeline");
+
+        // The console heap description, then the two zero placement fields.
+        #[repr(C)]
+        struct HeapPacket([u32; 4], [u64; 2]);
+        let packet = HeapPacket([0, 64, 1, 1], [0; 2]);
+        let mut heap = std::ptr::null();
+        assert_eq!(crate::descriptor::create_heap(
+            std::ptr::null(), std::ptr::from_ref(&packet).cast(), &PAGEABLE_IIDS[0], &mut heap,
+        ), S_OK);
+
+        const PAGE: usize = crate::watch::PAGE;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // Separate registered buffers for UAV output and indirect input.
+        // SAFETY: a fresh, write-watched allocation, held through completion.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+        let out = mem as u64;
+        let args = out + PAGE as u64;
+        unsafe { (args as *mut [u32; 3]).write([1, 1, 1]) };
+        for start in [out, args] {
+            crate::shadow::register(start as usize, start, PAGE as u64);
+        }
+
+        let list = device.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipe);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, out);
+        state.set_constants(true, 0, &[0, 7], 0);
+        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1);  // same constants and table
+        state.set_constants(true, 0, &[4, 3], 0);
+        state.dispatch(&list, 1, 1, 1);
+        assert!(state.execute_indirect(&list, (2, 12, 1), args, None));
+        state.dispatch(&list, 1, 1, 1);  // after the foreign clamp and indirect call
+        state.set_view(true, 1, out + 64);  // same constants, different host table
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        device.execute(&[&list]);
+
+        // SAFETY: execute waited for the GPU and copied its declared writes back.
+        let words = unsafe { std::slice::from_raw_parts(mem.cast::<u32>(), 18) };
+        let mut expected = [0u32; 18];
+        expected[0] = 14;
+        expected[1] = 9;
+        expected[17] = 3;
+        assert_eq!(words, expected);
+        eprintln!("direct/indirect root-binding readback: {}, {}, {}", words[0], words[1], words[17]);
+        drop(state);
+        drop(list);
+        for start in [out, args] {
+            crate::shadow::unregister(start as usize, start);
+        }
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+        slot::<extern "system" fn(This) -> u32>(pipe, 0x10)(pipe);
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
     }
 
     #[test]

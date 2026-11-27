@@ -843,6 +843,20 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The ReBAR-copy budget (VICTORY_REBAR_COPIES_MB): a copy is charged
+    /// 64 KiB-aligned, only under the limit asked, and only while a tenth of
+    /// the card's budget and the kept room stay free.
+    #[test]
+    fn rebar_copy_budget_needs_room_and_the_live_charge() {
+        use super::rebar_copy_fits;
+        let budget = 8_192u64 << 20;
+        assert!(!rebar_copy_fits(1 << 20, 0, 0, budget, 0, 0), "off by default (limit 0)");
+        assert!(rebar_copy_fits(1 << 20, 0, 256 << 20, budget, 0, 0));
+        assert!(!rebar_copy_fits(1 << 20, 256 << 20, 256 << 20, budget, 0, 0));
+        assert!(!rebar_copy_fits(1 << 20, 0, 256 << 20, budget, budget, 0), "a tenth of the budget stays free");
+        assert!(rebar_copy_fits(1 << 20, 0, 256 << 20, budget, budget / 2, 0));
+        assert!(!rebar_copy_fits(1 << 20, 0, 256 << 20, budget, 0, budget), "kept room counts as used");
+    }
     /// Run once with VICTORY_CARD_SYNC_BATCH=0 and once with it set to 1.
     #[test]
     #[ignore = "requires a D3D12 adapter and the card hash pipeline; run alone"]
@@ -1694,7 +1708,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.shader_input_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2455,6 +2469,21 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+type RelayPiece<T> = (std::sync::Arc<T>, usize, usize, u64);
+
+// VICTORY_RELAY_COPY_RUNS=1 joins adjacent CopyBufferRegion calls on the
+// same command list. Keep piece boundaries for CPU merges and alias bookkeeping.
+fn relay_copy_runs<T>(pieces: &[RelayPiece<T>], join: bool) -> impl Iterator<Item = (&T, usize, usize, u64)> {
+    pieces.chunk_by(move |left, right| {
+        join && std::sync::Arc::ptr_eq(&left.0, &right.0)
+            && left.2 == right.1
+            && left.3.checked_add((left.2 - left.1) as u64) == Some(right.3)
+    }).map(|run| {
+        let (shadow, start, _, dest) = &run[0];
+        (shadow.as_ref(), *start, run[run.len() - 1].2, *dest)
+    })
+}
+
 /// Whether pieces fetched on a copy queue beside later flights are fetched
 /// again when those flights land (`VICTORY_QUEUE2_REFETCH=0`: not, as
 /// before; on by default with `VICTORY_QUEUE2` bit 1).
@@ -2521,6 +2550,31 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 #[cfg(test)]
 mod relay_tests {
     use super::{fetched_beside, flagged_pieces, landable, note_beside};
+
+    #[test]
+    fn joined_readback_preserves_bytes_order_holes_and_distinct_resources() {
+        use std::sync::Arc;
+        let first = Arc::new([1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let second = Arc::new([11u8, 12, 13, 14, 15, 16, 17, 18]);
+        let pieces = [
+            (first.clone(), 0, 2, 0), (first.clone(), 2, 4, 2),
+            (second.clone(), 4, 6, 4), (second.clone(), 6, 7, 8),
+            (second.clone(), 0, 2, 9), (first.clone(), 3, 5, 0),
+        ];
+        for (join, calls) in [(false, 6), (true, 5)] {
+            let mut bytes = [0xff; 11];
+            let mut count = 0;
+            for (source, lo, hi, dest) in super::relay_copy_runs(&pieces, join) {
+                let at = dest as usize;
+                bytes[at..at + hi - lo].copy_from_slice(&source[lo..hi]);
+                count += 1;
+            }
+            assert_eq!(count, calls);
+            assert_eq!(bytes, [4, 5, 3, 4, 15, 16, 0xff, 0xff, 17, 11, 12]);
+        }
+        let overflow = [(first.clone(), 0, 1, u64::MAX), (first, 1, 2, 0)];
+        assert_eq!(super::relay_copy_runs(&overflow, true).count(), 2);
+    }
 
     /// A piece fetched on the copy queue while a later flight was in the
     /// air is fetched again by that flight, and by no flight sent after
@@ -5153,6 +5207,8 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        static JOIN: OnceLock<bool> = OnceLock::new();
+        let join = *JOIN.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY_RUNS").is_some_and(|v| v == "1"));
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -5167,8 +5223,8 @@ impl Host {
                     // title's either way.
                     let after = second.order_done();
                     let copy = second.down.list()?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    for (shadow, lo, hi, at) in relay_copy_runs(&pieces, join) {
+                        copy.1.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
                     second.down.wait(job, event)?;
@@ -5187,8 +5243,8 @@ impl Host {
                 }
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in relay_copy_runs(&pieces, join) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -7373,7 +7429,7 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        let (buffer, data) = host.shader_input_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -7386,7 +7442,7 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host.shader_input_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -8423,6 +8479,45 @@ impl Host {
         }
     }
 
+    /// A CPU-write-only mapping of a host allocation in a GPU upload heap
+    /// (the card's memory the CPU maps: Resizable BAR): the CPU fills it and
+    /// shaders read it, with no copy to the card before the submission. The
+    /// caller keeps its usual upload buffer if the feature is disabled,
+    /// `VICTORY_GPU_UPLOAD_READONLY_MB` has no room left, or the host does
+    /// not support the allocation.
+    pub(crate) fn readonly_gpu_upload(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static LIMIT: OnceLock<u64> = OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| {
+            readonly_upload_limit(std::env::var("VICTORY_GPU_UPLOAD_READONLY_MB").ok().as_deref())
+        });
+        if size == 0 || size > limit {
+            return None;
+        }
+        let charge = size.checked_next_multiple_of(64 << 10)?;
+        // One creator at a time spends the headroom; releases only subtract.
+        let _allocating = READONLY_UPLOAD_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
+        let [budget, used, ..] = self.video_memory()?;
+        let kept = crate::shadow::card_room_kept().saturating_add(crate::resource::targets_room_kept());
+        if !readonly_upload_fits(charge, READONLY_UPLOAD_BYTES.load(Ordering::Relaxed), limit, budget, used, kept) {
+            return None;
+        }
+        let (buffer, data) = self.gpu_upload_buffer(size)?;
+        let notifier = buffer.cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>().ok()?;
+        // SAFETY: our strong reference keeps the resource alive until after
+        // the charge is recorded; the callback never dereferences its data.
+        unsafe { notifier.RegisterDestructionCallback(Some(release_readonly_upload), charge as usize as *const _) }.ok()?;
+        READONLY_UPLOAD_BYTES.fetch_add(charge, Ordering::Relaxed);
+        Some((buffer, data))
+    }
+
+    /// Private host allocations for shader inputs (constants, vertices,
+    /// tables, list scratch the CPU fills). The CPU only stores into this
+    /// mapping; unlike a guest buffer, nothing aliases it through a UAV or a
+    /// readback. [`Self::readonly_gpu_upload`] while it has room, else the
+    /// usual upload buffer.
+    pub(crate) fn shader_input_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.readonly_gpu_upload(size).or_else(|| self.upload_buffer(size))
+    }
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -9037,6 +9132,51 @@ pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.
+/// GPU upload heaps for host allocations shaders only read (constants,
+/// vertices, tables and list scratch the CPU fills), in bytes: the callback
+/// gives the charge back when the last D3D reference goes, including
+/// references kept by command lists and descriptor tables.
+/// `VICTORY_GPU_UPLOAD_READONLY_MB` (0, off by default: no such allocation;
+/// 64-128 MB is the budget recommended for an 8 GB card) caps them.
+static READONLY_UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READONLY_UPLOAD_ALLOCATION: Mutex<()> = Mutex::new(());
+
+unsafe extern "system" fn release_readonly_upload(charge: *mut std::ffi::c_void) {
+    READONLY_UPLOAD_BYTES.fetch_sub(charge as usize as u64, Ordering::Relaxed);
+}
+
+/// The cap in bytes (`VICTORY_GPU_UPLOAD_READONLY_MB`), 0 when unset: no
+/// shader-input allocation goes to the card's memory.
+fn readonly_upload_limit(mb: Option<&str>) -> u64 {
+    mb.and_then(|value| value.trim().parse::<u64>().ok()).unwrap_or(0).min(2048) << 20
+}
+
+/// Whether `size` more bytes of shader-input allocations fit: under the cap
+/// and with a tenth of the card's budget, and the room kept for title buffers
+/// and render targets, still free (as a card copy's `card_for`).
+fn readonly_upload_fits(size: u64, live: u64, limit: u64, budget: u64, used: u64, kept: u64) -> bool {
+    let available = budget.saturating_sub(budget / 10).saturating_sub(used).saturating_sub(kept);
+    size != 0 && size <= limit.saturating_sub(live) && size <= available
+}
+
+#[cfg(test)]
+mod readonly_upload_tests {
+    use super::{readonly_upload_fits, readonly_upload_limit};
+
+    #[test]
+    fn the_shader_input_budget_is_off_by_default_and_keeps_a_tenth_free() {
+        assert_eq!(readonly_upload_limit(None), 0);
+        assert_eq!(readonly_upload_limit(Some("-1")), 0);
+        assert_eq!(readonly_upload_limit(Some(" 1 ")), 1 << 20);
+        assert_eq!(readonly_upload_limit(Some("18446744073709551615")), 2 << 30);
+        let budget = 8_192u64 << 20;
+        assert!(!readonly_upload_fits(1 << 20, 0, 0, budget, 0, 0), "off by default");
+        assert!(readonly_upload_fits(1 << 20, 0, 64 << 20, budget, 0, 0));
+        assert!(!readonly_upload_fits(1 << 20, 64 << 20, 64 << 20, budget, 0, 0));
+        assert!(!readonly_upload_fits(1 << 20, 0, 64 << 20, budget, budget, 0));
+        assert!(!readonly_upload_fits(1 << 20, 0, 64 << 20, budget, 0, budget));
+    }
+}
 pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     // (flag, set or clear forbids, state bits): render target, unordered
     // access, depth, denied shader resource.
@@ -9050,6 +9190,24 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
         .fold(state, |s, &(_, _, bits)| s & !bits)
+}
+
+/// Bytes of host copies in CPU-visible card memory alive ([`Host::rebar_copy`]),
+/// charged until each resource's last release (the callback data is the size).
+pub(crate) static REBAR_COPY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REBAR_COPY_ALLOCATION: Mutex<()> = Mutex::new(());
+
+unsafe extern "system" fn release_rebar_copy(charge: *mut std::ffi::c_void) {
+    REBAR_COPY_BYTES.fetch_sub(charge as usize as u64, Ordering::Relaxed);
+}
+
+/// Whether `size` more bytes of CPU-visible card memory fit: under the
+/// `limit` asked (`VICTORY_REBAR_COPIES_MB`) and with a tenth of the card's
+/// budget, and the room kept for title buffers and render targets, still free
+/// (the rule a card copy's `card_for` also follows).
+fn rebar_copy_fits(size: u64, live: u64, limit: u64, budget: u64, used: u64, kept: u64) -> bool {
+    let available = budget.saturating_sub(budget / 10).saturating_sub(used).saturating_sub(kept);
+    size != 0 && size <= limit.saturating_sub(live) && size <= available
 }
 
 impl Host {
@@ -9219,6 +9377,35 @@ impl Host {
         }
     }
 
+    /// A host copy of title memory in the card's memory that the CPU maps
+    /// (a GPU upload heap: Resizable BAR), for copies shaders only read
+    /// ([`crate::shadow::rebar_copies`]): the CPU writes the title's bytes
+    /// straight into it and shaders read it at the card's speed. Never read on
+    /// the CPU: that runs at some 30 MB/s. Charged to its own count until the
+    /// resource's last release, and made only while a tenth of the card's
+    /// budget, and the room kept for big copies and render targets, stays free.
+    pub(crate) fn rebar_copy(&self, size: u64, limit: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if size == 0 || limit == 0 || !self.gpu_upload() {
+            return None;
+        }
+        // A resource is placed on a 64 KiB boundary: charged as it is made.
+        let charge = size.checked_next_multiple_of(64 << 10)?;
+        // As for a card copy: one creator at a time spends the headroom;
+        // releases only subtract from the count and never take this lock.
+        let _allocating = REBAR_COPY_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
+        let [budget, used, ..] = self.video_memory()?;
+        let kept = crate::shadow::card_room_kept().saturating_add(crate::resource::targets_room_kept());
+        if !rebar_copy_fits(charge, REBAR_COPY_BYTES.load(Ordering::Relaxed), limit, budget, used, kept) {
+            return None;
+        }
+        let (buffer, data) = self.gpu_upload_buffer(size)?;
+        let notifier = buffer.cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>().ok()?;
+        // SAFETY: our strong reference keeps the resource alive until after
+        // the charge is recorded; the callback never dereferences its data.
+        unsafe { notifier.RegisterDestructionCallback(Some(release_rebar_copy), charge as usize as *const _) }.ok()?;
+        REBAR_COPY_BYTES.fetch_add(charge, Ordering::Relaxed);
+        Some((buffer, data))
+    }
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

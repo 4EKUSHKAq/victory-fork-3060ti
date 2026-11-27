@@ -2446,7 +2446,12 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // Console flags: bit 2 (4) marks a buffer shaders write (unordered
+        // access), bit 3 (8) one shaders may not read. Shaders only read a
+        // buffer with neither, and only such a buffer's host copy may stay in
+        // the card's memory the CPU maps (`crate::shadow::rebar_copies`).
+        let read_only = desc.flags & (4 | 8) == 0;
+        crate::shadow::register_buffer(at, resource.data() as u64, desc.width, read_only);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

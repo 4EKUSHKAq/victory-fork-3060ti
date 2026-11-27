@@ -122,7 +122,7 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
 /// Where a pixel shader of the title's decoration bake finds what it
@@ -558,6 +558,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Final arguments sent to each host root signature (graphics, compute).
+    root_bindings: [RootBindings; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -573,6 +575,114 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+}
+
+#[derive(Default)]
+struct RootBindings {
+    constants: Vec<Option<Vec<u32>>>,
+    resources: Vec<Option<RootResource>>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum RootResource {
+    Table(u64),
+    Cbv(u64),
+    Srv(u64),
+    Uav(u64),
+}
+
+/// VICTORY_ROOT_BIND_CACHE=1 omits repeated host setters. The values
+/// being compared have already been resolved for this draw, including
+/// the current descriptor heaps, memory alias and dynamic table offsets.
+fn root_bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BIND_CACHE").is_some_and(|v| v == "1"))
+}
+
+fn bind_argument<T: PartialEq>(
+    slots: &mut Vec<Option<T>>,
+    param: u32,
+    value: T,
+    cache: bool,
+    emit: impl FnOnce(&T),
+) {
+    if !cache {
+        emit(&value);
+        return;
+    }
+    let index = param as usize;
+    if index >= slots.len() {
+        slots.resize_with(index + 1, || None);
+    }
+    if slots[index].as_ref() != Some(&value) {
+        emit(&value);
+        slots[index] = Some(value);
+    }
+}
+
+impl RootBindings {
+    fn clear(&mut self) {
+        self.constants.clear();
+        self.resources.clear();
+    }
+}
+
+#[cfg(test)]
+mod root_binding_tests {
+    use super::{RootResource, State, bind_argument};
+
+    #[test]
+    fn only_identical_resolved_arguments_in_one_domain_are_reused() {
+        let mut state = State::default();
+        let mut calls = 0;
+        let mut bind = |state: &mut State, compute, param, resource| {
+            let resources = &mut state.root_bindings[usize::from(compute)].resources;
+            bind_argument(resources, param, resource, true, |_| calls += 1);
+        };
+        assert!(state.change_root(false, 11));
+        bind(&mut state, false, 0, RootResource::Table(42));
+        assert!(!state.change_root(false, 11));
+        bind(&mut state, false, 0, RootResource::Table(42));
+        bind(&mut state, false, 1, RootResource::Table(42));
+        bind(&mut state, false, 0, RootResource::Table(43));
+        assert!(state.change_root(true, 11));
+        bind(&mut state, true, 0, RootResource::Table(43));
+        assert!(state.change_root(false, 12));
+        bind(&mut state, false, 0, RootResource::Table(43));
+        bind(&mut state, true, 0, RootResource::Table(43));
+        // The indirect clamp invalidates the compute signature. Its next
+        // installation must re-emit even though it uses the same object.
+        state.host_roots[1] = 0;
+        assert!(state.change_root(true, 11));
+        bind(&mut state, true, 0, RootResource::Table(43));
+        bind(&mut state, true, 0, RootResource::Srv(43));
+        state.reset(std::ptr::null());
+        assert!(state.change_root(true, 11));
+        bind(&mut state, true, 0, RootResource::Srv(43));
+        assert_eq!(calls, 8);
+    }
+
+    #[test]
+    fn constants_compare_every_word_and_length_and_can_be_replayed() {
+        let mut state = State::default();
+        let words = [vec![1, 2], vec![1, 2], vec![1, 3], vec![1], vec![1, 2]];
+        for (cache, expected) in [(false, 5usize), (true, 4)] {
+            let mut emitted = Vec::new();
+            for value in &words {
+                bind_argument(&mut state.root_bindings[0].constants, 2, value.clone(), cache, |v| {
+                    emitted.push(v.clone());
+                });
+            }
+            assert_eq!(emitted.len(), expected);
+            assert_eq!(emitted.last(), words.last());
+            state.tables_done();
+            bind_argument(&mut state.root_bindings[0].constants, 2, vec![1, 2], cache, |v| {
+                emitted.push(v.clone());
+            });
+            assert_eq!(emitted.len(), expected + 1);
+            state.reset(std::ptr::null());
+        }
+    }
 }
 
 impl Drop for State {
@@ -592,6 +702,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        self.root_bindings.iter_mut().for_each(RootBindings::clear);
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -1379,7 +1490,7 @@ impl State {
         };
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        if self.change_root(compute, root) {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1388,7 +1499,6 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
-            self.host_roots[usize::from(compute)] = root;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1444,29 +1554,27 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
+                bind_argument(
+                    &mut self.root_bindings[usize::from(compute)].constants,
+                    param,
+                    values,
+                    root_bind_cache(),
+                    |values| unsafe {
+                        // SAFETY: an open list; the vector covers the parameter.
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
+                    },
+                );
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            self.bind_resource(list, compute, param, RootResource::Srv(m.directory));
                         }
                         continue;
                     }
@@ -1474,15 +1582,7 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            Some(gpu) => self.bind_resource(list, compute, param, RootResource::Srv(gpu)),
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1521,30 +1621,15 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    let resource = if srv { RootResource::Srv(gpu) } else { RootResource::Cbv(gpu) };
+                    self.bind_resource(list, compute, param, resource);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        self.bind_resource(list, compute, param, RootResource::Uav(m.faults));
                     }
                     continue;
                 }
@@ -1564,6 +1649,49 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// Reinstalling a signature invalidates all its arguments. This includes
+    /// a fresh list after a cut, a heap change and the compute state used by
+    /// the indirect clamp, all of which reset host_roots.
+    fn change_root(&mut self, compute: bool, root: usize) -> bool {
+        let side = usize::from(compute);
+        if self.host_roots[side] == root {
+            return false;
+        }
+        self.host_roots[side] = root;
+        self.root_bindings[side].clear();
+        true
+    }
+
+    /// Only the final D3D12 command can be redundant. The caller has
+    /// already refreshed the resource and recorded any shader writes.
+    fn bind_resource(&mut self, list: &HostList, compute: bool, param: u32, resource: RootResource) {
+        let l = &list.list;
+        bind_argument(
+            &mut self.root_bindings[usize::from(compute)].resources,
+            param,
+            resource,
+            root_bind_cache(),
+            |&value| unsafe {
+                // SAFETY: our signature supplies the parameter's kind. The
+                // resolved address or descriptor heap is held by the list.
+                match (compute, value) {
+                    (false, RootResource::Table(ptr)) => {
+                        l.SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr })
+                    }
+                    (true, RootResource::Table(ptr)) => {
+                        l.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr })
+                    }
+                    (false, RootResource::Cbv(gpu)) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                    (true, RootResource::Cbv(gpu)) => l.SetComputeRootConstantBufferView(param, gpu),
+                    (false, RootResource::Srv(gpu)) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                    (true, RootResource::Srv(gpu)) => l.SetComputeRootShaderResourceView(param, gpu),
+                    (false, RootResource::Uav(gpu)) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                    (true, RootResource::Uav(gpu)) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                }
+            },
+        );
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1620,14 +1748,7 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            self.bind_resource(list, compute, param, RootResource::Uav(gpu));
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1671,14 +1792,7 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        self.bind_resource(list, compute, param, RootResource::Table(handle.ptr));
         true
     }
 
@@ -1754,14 +1868,7 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        self.bind_resource(list, compute, param, RootResource::Table(handle.ptr));
         true
     }
 
@@ -2372,14 +2479,30 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
+        // Also within a time per frame: the pass runs on a thread that
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        // It was 250 ms a pass (750 while a backlog drains), and with
+        // thousands of slots due the pass took all of it in every frame of
+        // the world (81 passes of 81 at 250 ms on the RTX 5080): a frame
+        // could not be shorter. A game streams its textures in a slice of
+        // each frame; `VICTORY_TEXTURE_STAGE_MS` (6) is that slice, three
+        // times as long while a backlog drains. Its unit is microseconds
+        // with `VICTORY_TEXTURE_STAGE_US`.
+        // VICTORY_TEXTURE_STAGE_PER_FRAME=1 makes the budget one slice per
+        // title frame (off by default in this fork: the per-pass budget and
+        // its 250 ms default are what runs unless the A/B asks for the slice;
+        // `VICTORY_TEXTURE_STAGE_PER_FRAME=0` is then the same as unset).
+        // Early passes keep their own budgets.
+        static LIMIT: std::sync::OnceLock<(bool, std::time::Duration)> = std::sync::OnceLock::new();
+        let (shared, span) = *LIMIT.get_or_init(|| {
+            let shared = std::env::var_os("VICTORY_TEXTURE_STAGE_PER_FRAME").is_some_and(|v| v == "1");
+            let var = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            let span = var("VICTORY_TEXTURE_STAGE_US").map(std::time::Duration::from_micros)
+                .unwrap_or_else(|| std::time::Duration::from_millis(var("VICTORY_TEXTURE_STAGE_MS").unwrap_or(if shared { 6 } else { 250 })));
+            (shared, span)
+        });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
@@ -2389,9 +2512,27 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
+        // Recording threads share the ordinary slice. A competing pass
+        // leaves its slots due. No wait on another recording thread.
+        static USED: std::sync::Mutex<(u64, std::time::Duration)> =
+            std::sync::Mutex::new((0, std::time::Duration::ZERO));
+        let mut used = None;
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+            }
+            None if shared => {
+                let mut budget = match USED.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                };
+                if budget.0 > frame { return; }
+                if budget.0 != frame { *budget = (frame, std::time::Duration::ZERO); }
+                let remaining = span.saturating_sub(budget.1);
+                if remaining.is_zero() { return; }
+                used = Some(budget);
+                (remaining, per_frame)
             }
             None => (span, per_frame),
         };
@@ -2669,6 +2810,9 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        if let Some(mut budget) = used {
+            budget.1 += began.elapsed();
         }
     }
 
@@ -3987,8 +4131,9 @@ impl State {
 }
 
 /// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
+/// `stride` bytes apart. There are no root arguments, so ExecuteIndirect
+/// leaves the cached root parameters intact. The preceding GPU clamp does
+/// bind its own compute signature; its caller invalidates host_roots[1].
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());

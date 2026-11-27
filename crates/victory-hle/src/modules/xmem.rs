@@ -782,14 +782,21 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    map_pages_locked(&mut physical, address, n, pages)
+}
+
+/// The caller holds both the physical page table and the remapping guard.
+fn map_pages_locked(
+    physical: &mut Physical, address: *mut c_void, n: usize, pages: *const usize,
+) -> *mut c_void {
+    let base = address as usize;
+    unmap(physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -811,7 +818,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -826,23 +833,36 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
+    // VICTORY_SCATTER_RUNS=1 amortizes both locks over at most 64 entries.
+    // Install each page as its own Windows view, as in scalar Scatter.
+    static GROUP: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_SCATTER_RUNS").is_some_and(|v| v == "1")
+    });
+    scatter_pages(addresses, n, pages, *GROUP)
+}
+
+fn scatter_pages(addresses: *const *mut c_void, n: usize, pages: *const usize, group: bool) -> BOOL {
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
-            return 0;
+    let per_lock = if group { 64 } else { 1 };
+    for first in (0..n).step_by(per_lock) {
+        let mut physical = physical();
+        let _changing = victory_gpu::title_memory_remapping();
+        for i in first..n.min(first.saturating_add(per_lock)) {
+            // Read only the current entry. An earlier remap can change what
+            // the title's address and page arrays show at the next entry.
+            // SAFETY: the title supplies n addresses and, if present, n pages.
+            let address = unsafe { *addresses.add(i) };
+            let number = if pages.is_null() { 0 } else { unsafe { *pages.add(i) } };
+            let page = if number == 0 { std::ptr::null() } else { &number };
+            // Independent views are required even for contiguous addresses.
+            // Windows can only unmap a whole view: merging these pages would
+            // later remove live neighbours, including their CPU protections,
+            // while an ordinary title thread can be reading those neighbours.
+            if map_pages_locked(&mut physical, address, 1, page).is_null() {
+                return 0;
+            }
         }
     }
     1
@@ -1424,6 +1444,100 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn scatter_runs_preserve_aliases_clears_and_partial_failures() {
+        const COUNT: usize = 4;
+        for group in [false, true] {
+            let mut pages = [0usize; COUNT];
+            let mut n = COUNT;
+            assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+            let base = XMemVirtualAlloc(std::ptr::null_mut(), COUNT * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let targets: [_; COUNT] = std::array::from_fn(|k| base.wrapping_byte_add(k * PAGE));
+            let scatter = |dest: &[*mut c_void], nums: *const usize| scatter_pages(dest.as_ptr(), dest.len(), nums, group);
+            assert_eq!(scatter(&targets, pages.as_ptr()), 1);
+            let views = physical().views.range(base as usize..base as usize + COUNT * PAGE).count();
+            assert_eq!(views, COUNT);
+            // SAFETY: ces quatre pages viennent d’être mappées en lecture/écriture.
+            for (k, &at) in targets.iter().enumerate() {
+                unsafe { at.cast::<u8>().write(10 + k as u8) };
+            }
+            // A title thread may read or protect an unrelated page while
+            // another replaces this one. Recreating the whole OS view would
+            // both remove that neighbour briefly and reset its protection.
+            use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+            let mut old = 0;
+            assert_ne!(unsafe { VirtualProtect(targets[3], PAGE, PAGE_READONLY, &mut old) }, 0);
+            assert_eq!(scatter(&targets[1..2], pages.as_ptr()), 1);
+            let neighbour = query(targets[3]).host;
+            assert_eq!(neighbour.Protect, PAGE_READONLY, "a remap changed its neighbour's protection");
+            assert_eq!(neighbour.AllocationBase, targets[3], "the neighbour must be its own view");
+            assert_ne!(unsafe { VirtualProtect(targets[3], PAGE, PAGE_READWRITE, &mut old) }, 0);
+            assert_eq!(scatter(&targets[1..3], [0, 0].as_ptr()), 1);
+            assert_eq!(query(targets[1]).host.State, MEM_RESERVE);
+            assert_eq!(query(targets[2]).host.State, MEM_RESERVE);
+            // SAFETY: les deux pages extérieures restent mappées.
+            assert_eq!(unsafe { targets[0].cast::<u8>().read() }, 10);
+            assert_eq!(unsafe { targets[3].cast::<u8>().read() }, 13);
+
+            let repeated = [targets[1], targets[1], targets[2]];
+            assert_eq!(scatter(&repeated, [pages[0], pages[3], pages[1]].as_ptr()), 1);
+            // SAFETY: les deux destinations sont mappées. Les écritures de la
+            // première sont visibles par son autre vue après la répétition.
+            unsafe {
+                targets[1].cast::<u8>().write(42);
+                assert_eq!(targets[3].cast::<u8>().read(), 42);
+                assert_eq!(targets[2].cast::<u8>().read(), 11);
+            }
+            assert_eq!(scatter(&targets[..3], [pages[2], usize::MAX, pages[0]].as_ptr()), 0);
+            // La destination invalide a été retirée, la suivante est intacte.
+            assert_eq!(query(targets[1]).host.State, MEM_RESERVE);
+            // SAFETY: la première page a été remplacée, la troisième est restée.
+            assert_eq!(unsafe { targets[0].cast::<u8>().read() }, 12);
+            assert_eq!(unsafe { targets[2].cast::<u8>().read() }, 11);
+            assert_eq!(scatter(&targets, std::ptr::null()), 1);
+            // Le préfixe valide est installé avant l’échec suivant.
+            assert_eq!(scatter(&targets, [pages[0], pages[1], usize::MAX, pages[3]].as_ptr()), 0);
+            assert_eq!(query(targets[0]).host.State, MEM_COMMIT);
+            assert_eq!(query(targets[1]).host.State, MEM_COMMIT);
+            assert_eq!(query(targets[2]).host.State, MEM_RESERVE);
+            assert_eq!(query(targets[3]).host.State, MEM_RESERVE);
+            assert_eq!(scatter(&targets[..2], std::ptr::null()), 1);
+            // Earlier individual mappings leave four adjacent placeholders.
+            // A section alias outside XMem's view table occupies the third:
+            // install the valid prefix, preserve its bytes and stop before
+            // touching the fourth. The same Scatter then succeeds once the
+            // foreign view is returned to its placeholder.
+            for &at in &targets {
+                let vacant = query(at).host;
+                assert_eq!(vacant.State, MEM_RESERVE);
+                assert_eq!(vacant.AllocationBase, at);
+            }
+            let external = physical().pages[&pages[3]].clone();
+            let busy = unsafe { MapViewOfFile3(
+                external.section.handle, GetCurrentProcess(), targets[2], (external.index * PAGE) as u64,
+                PAGE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0,
+            ) };
+            assert_eq!(busy.Value, targets[2]);
+            unsafe { busy.Value.cast::<u32>().write(0x1234abcd) };
+            assert_eq!(scatter(&targets, pages.as_ptr()), 0);
+            assert_eq!(query(targets[0]).host.State, MEM_COMMIT);
+            assert_eq!(query(targets[1]).host.State, MEM_COMMIT);
+            assert_eq!(unsafe { busy.Value.cast::<u32>().read() }, 0x1234abcd);
+            assert_eq!(query(targets[3]).host.State, MEM_RESERVE);
+            assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), busy, MEM_PRESERVE_PLACEHOLDER) }, 0);
+            assert_eq!(scatter(&targets, pages.as_ptr()), 1);
+            assert_eq!(scatter(&targets, std::ptr::null()), 1);
+            // SAFETY: toutes les vues ont été rendues à notre réservation.
+            unsafe {
+                const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+                VirtualFree(base, COUNT * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+            }
+            assert_eq!(XMemFreePhysicalPages(COUNT, pages.as_ptr()), 1);
+        }
     }
 
     #[test]

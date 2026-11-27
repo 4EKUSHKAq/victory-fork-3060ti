@@ -2447,6 +2447,19 @@ fn relay_exact() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
+/// `VICTORY_ASYNC_COPY_BACK=1`: the wait before a refresh gone stale under the
+/// flights in the air (the point [`stale_under_flights`] makes) asks only the
+/// flights that may write what the submission refreshes, instead of settling
+/// everything in the air. The XCL_MAP_ASYNC idea (xcl #2952 п.5 / #1993: a
+/// `Map` waits only for the copies that overlap it) applied to this fork's
+/// relay: the relay already waits range by range for plain title-memory reads
+/// ([`relay_exact`]); this flag adds the stale-refresh point, which settled the
+/// whole line. Off by default (the paired A/B in Round 9 decides).
+pub(crate) fn async_copy_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_COPY_BACK").is_some_and(|v| v == "1"))
+}
+
 /// Told when something joins [`LINE`], for the thread that lands flights
 /// ([`relay`]); [`LINE_MOVED`] stays the word for the thread that looks at
 /// what queues hold.
@@ -2963,13 +2976,15 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, runs, true, false)
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
-/// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+/// counted for the frame line; `refresh` whether the submission's refreshes
+/// count too (for [`Host::wait_stale`]: a refresh copies title bytes a
+/// flight may write and must not start before that flight has landed).
+fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool, refresh: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3026,8 +3041,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
+                Step::Refresh(_, address, len) => {
+                    if refresh && touches(written, *address, *address + *len) {
+                        return Some(WHY_STALE);
+                    }
+                }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::Tiles(_) => {}
+                Step::GpuWrite(..) | Step::Host(_) | Step::Tiles(_) => {}
             }
         }
     }
@@ -6105,12 +6125,24 @@ impl Host {
         working(was_working);
     }
 
+    /// The wait before a refresh gone stale under the flights in the air
+    /// ([`stale_under_flights`]): with [`async_copy_back`] only until the
+    /// flights whose shaders may write what the submission refreshes have
+    /// landed (the XCL_MAP_ASYNC idea); else every flight in the air, as
+    /// before ([`Host::settle`]).
+    fn wait_stale(&self, runs: &[&HostList], submitted: &mut u64) {
+        if async_copy_back() && relay() && relay_exact() {
+            relay_wait(WHY_STALE, |line| blocked_by(&line.written, runs, false, true).is_none());
+        } else {
+            self.settle(submitted, WHY_STALE);
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        #[cfg(feature = "diagnostics")]
+    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {        #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
@@ -6130,7 +6162,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, false, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6198,13 +6230,13 @@ impl Host {
             // title memory, which other copies of it must see.
             if behind && stale_under_flights(runs) {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.wait_stale(runs, &mut submitted);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            self.wait_stale(runs, &mut submitted);
             settled += settling.elapsed();
         }
         for list in runs {

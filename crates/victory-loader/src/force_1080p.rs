@@ -1,7 +1,8 @@
 //! The title's output size and render scale (`VICTORY_FORCE_1080P`,
-//! `VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`; each off without it): places in
-//! the title's code changed at load, each compared byte for byte first and
-//! left alone, said so, if it differs (another build of the title).
+//! `VICTORY_NATIVE_1440P`, `VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`; each off
+//! without it): places in the title's code changed at load, each compared byte
+//! for byte first and left alone, said so, if it differs (another build of the
+//! title).
 //!
 //! What the title does (`game_scarlett_master.exe` 1.0.2.1, image offsets):
 //!
@@ -28,6 +29,23 @@
 //!   2/3 at +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p). Here that
 //!   constant is replaced for `VICTORY_RENDER_SCALE` (1.0: the render targets
 //!   are the output's own 1920x1080).
+//! - **Native 1440p** (`VICTORY_NATIVE_1440P=1`): the title presents at
+//!   3840x2160 on Series X, its scene drawn at 2560x1440 and scaled up by its
+//!   temporal pass. With the switch the Series X SDR display mode entry
+//!   (+0x615c100: 3840x2160 at 60 Hz) becomes 2560x1440, the Settings
+//!   preview's viewport load (+0x58048d4, which loads the legacy 3840x2160
+//!   size) reads that display mode instead, the temporal scene scale
+//!   (+0x28f1e7e) becomes 1.0 and the output size 2560x1440: the title makes
+//!   a 1440p output with the interface laid out for it and no 4K pass runs.
+//!   The scanout reservation (+0x247ad4a, 64 MB) is left as it is (34 MB more
+//!   than a 1440p pair of buffers needs; our own buffer-pool check is jumped
+//!   over anyway).
+//!   From DexNom/VIctory's `native_1440p.rs` via trustno1-coder/VIctory-NVIDIA
+//!   (`apps/victory/src/native_1440p.rs`, GPL-3.0-or-later): four fields, and
+//!   their retail build hash, b99f876b74d4a77f…, is exactly our image's (the
+//!   loader's BLAKE3 of the file; its SHA-256 is e95020b2…), so every byte
+//!   they compare is here too (checked with a PE parse, `audit/round10/
+//!   pecheck.py`).
 //!
 //! The port from Belobug's `VIctory-Belobug-AMD` (`crates/victory-loader/src/
 //! resolution.rs`, GPL-3.0-or-later, the same title build: every site below
@@ -36,10 +54,13 @@
 //! (+0x7e93f0) are not ported (Round 8; the Series S FidelityFX path is the one
 //! that divides by a zero jitter phase count at some scales).
 //!
-//! `VICTORY_FORCE_1080P=1` is the round's switch: output 1920x1080 and render
+//! `VICTORY_FORCE_1080P=1` is the Round 8 switch: output 1920x1080 and render
 //! scale 1.0, so the title itself makes its back buffers and render targets
 //! 1920x1080. `VICTORY_OUTPUT`/`VICTORY_RENDER_SCALE` set on their own ask for
 //! the same things piecemeal (they win over the forced values).
+//!
+//! `VICTORY_NATIVE_1440P=1` (Round 10 default): output 2560x1440, the SDR
+//! display mode and the Settings viewport patched, render scale 1.0.
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [
@@ -64,6 +85,25 @@ pub fn forced() -> bool {
     }
 }
 
+/// `VICTORY_NATIVE_1440P=1`: the native 1440p patch of DexNom's fork through
+/// trustno1-coder/VIctory-NVIDIA: a 2560x1440 output, the Series X SDR display
+/// mode made 2560x1440 (the interface laid out for it), the Settings preview's
+/// viewport pointed at it and the temporal scene scale 1.0.
+pub fn native_1440p() -> bool {
+    let spec = std::env::var("VICTORY_NATIVE_1440P").ok();
+    match spec.as_deref().map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => {
+            eprintln!("VIctory: VICTORY_NATIVE_1440P={other}: expected 1 (on) or 0 (off)");
+            false
+        }
+    }
+}
+
+/// The size `VICTORY_NATIVE_1440P=1` asks for.
+pub const NATIVE_1440P: (u32, u32) = (2560, 1440);
+
 /// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `VICTORY_FORCE_1080P=1` without
 /// it asks for 1920x1080. `None` if unset (or not a mode, said why).
 pub fn asked_output() -> Option<(u32, u32)> {
@@ -77,6 +117,9 @@ pub fn asked_output() -> Option<(u32, u32)> {
             return None;
         }
         return size;
+    }
+    if native_1440p() {
+        return Some(NATIVE_1440P);
     }
     forced().then_some((1920, 1080))
 }
@@ -99,6 +142,9 @@ pub fn asked_render_scale() -> Option<f32> {
             return None;
         }
         return scale;
+    }
+    if native_1440p() {
+        return Some(1.0);
     }
     forced().then_some(1.0)
 }
@@ -158,6 +204,42 @@ pub const POOL_CHECK: Site = Site {
 pub fn pool_check_code() -> Vec<u8> {
     let mut c = POOL_CHECK.bytes[..8].to_vec();
     c[6] = 0xeb;
+    c
+}
+
+/// The Series X SDR display mode entry (+0x615c100): 3840x2160 at 60 Hz in the
+/// title's own mode table (its fifth 16-byte entry). The native 1440p patch
+/// makes it 2560x1440; `VICTORY_FORCE_1080P` alone leaves it alone.
+pub const SDR_MODE: Site = Site {
+    at: 0x615c100,
+    what: "the title's SDR display mode (3840x2160)",
+    bytes: &[0, 15, 0, 0, 0x70, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0],
+};
+
+/// What goes at [`SDR_MODE`] for `width` x `height` (8 bytes of its 16).
+pub fn sdr_mode_code(width: u32, height: u32) -> Vec<u8> {
+    let mut c = SDR_MODE.bytes[..8].to_vec();
+    c[..4].copy_from_slice(&width.to_le_bytes());
+    c[4..8].copy_from_slice(&height.to_le_bytes());
+    c
+}
+
+/// Settings' preview viewport size load (+0x58048d4): `vmovss xmm1,
+/// [rip+disp]` reads the legacy 3840x2160 size even when a 1440p interface
+/// surface exists. The native 1440p patch points it at the SDR display mode's
+/// width.
+pub const UI_VIEWPORT: Site = Site {
+    at: 0x58048d4,
+    what: "Settings' preview viewport size load",
+    bytes: &[0xc5, 0xfb, 0x10, 0x0d, 0x10, 0xf0, 0x13, 0x05], // vmovss xmm1, [rip+0x513f010]
+};
+
+/// What goes at [`UI_VIEWPORT`]: the same load, its displacement made to the
+/// SDR display mode's entry.
+pub fn ui_viewport_code() -> Vec<u8> {
+    let mut c = UI_VIEWPORT.bytes.to_vec();
+    let displacement = (SDR_MODE.at as i64 - (UI_VIEWPORT.at as i64 + 8)) as i32;
+    c[4..8].copy_from_slice(&displacement.to_le_bytes());
     c
 }
 
@@ -279,10 +361,22 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
+    let output = asked_output();
+    if let Some((w, h)) = output {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+        }
+        if (w, h) == NATIVE_1440P {
+            // The native 1440p patch's fields: the display mode the title reads,
+            // its interface size and Settings' preview viewport.
+            asked.push((&SDR_MODE, sdr_mode_code(w, h), format!("{w}x{h}")));
+            asked.push((&UI_VIEWPORT, ui_viewport_code(), format!("{w}x{h}")));
+        } else if native_1440p() {
+            eprintln!(
+                "VIctory: VICTORY_NATIVE_1440P=1 with VICTORY_OUTPUT={w}x{h}: \
+                 the display-mode and viewport patches are for 2560x1440 only, left alone"
+            );
         }
     }
     if let Some(s) = asked_render_scale() {
@@ -390,6 +484,31 @@ mod tests {
             pool_check_code(),
             [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]
         );
+    }
+
+    /// The native 1440p patch writes the display mode's size and points the
+    /// Settings viewport's load at that mode, keeping everything else of the
+    /// compared bytes; the stock mode entry is the 4K one.
+    #[test]
+    fn the_native_1440p_fields_keep_the_titles() {
+        assert_eq!(
+            &SDR_MODE.bytes[..8],
+            &[0, 15, 0, 0, 0x70, 8, 0, 0],
+            "stock Series X SDR mode is 3840x2160"
+        );
+        let mode = sdr_mode_code(2560, 1440);
+        assert_eq!(mode.len(), 8, "only the size of the 16-byte entry is written");
+        assert_eq!(&mode[..4], 2560u32.to_le_bytes());
+        assert_eq!(&mode[4..8], 1440u32.to_le_bytes());
+        assert_eq!(&SDR_MODE.bytes[8..], &[60, 0, 0, 0, 1, 0, 0, 0], "60 Hz and the flags stay");
+        let viewport = ui_viewport_code();
+        assert_eq!(&viewport[..4], &UI_VIEWPORT.bytes[..4], "the load stays");
+        let loaded = UI_VIEWPORT.at as i64
+            + 8
+            + i64::from(i32::from_le_bytes(viewport[4..8].try_into().unwrap()));
+        assert_eq!(loaded, SDR_MODE.at as i64, "the load reads the display mode");
+        assert_eq!(UI_VIEWPORT.bytes, [0xc5, 0xfb, 0x10, 0x0d, 0x10, 0xf0, 0x13, 0x05]);
+        assert_eq!(NATIVE_1440P, (2560, 1440));
     }
 
     #[cfg(windows)]

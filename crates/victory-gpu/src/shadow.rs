@@ -1401,6 +1401,27 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 /// merge), when that is a real delta: more than one run and under half the
 /// stretch. False when the whole stretch should be written as before (one
 /// change, or most of it); the bytes the caller then writes are the same.
+///
+/// Runs closer than [`DELTA_GAP`] bytes are written as one run (the gap is
+/// written as it already is, so nothing changes), and a delta of more than
+/// [`DELTA_RUNS`] such runs is written as the whole stretch in one call: the
+/// point is to cut the number of `write_mapped` calls, which the loading storm
+/// of a cutscene turns into a per-run stall (Round 12: a frame's copy-back went
+/// from ~20 ms to 0.8-1.8 s with `VICTORY_DELTA_LAND=1`).
+const DELTA_GAP: usize = 512;
+const DELTA_RUNS: usize = 64;
+
+/// The changed runs, those closer than [`DELTA_GAP`] merged into one.
+fn merged_delta_runs(runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(from, n) in runs {
+        match merged.last_mut() {
+            Some((start, len)) if from <= *start + *len + DELTA_GAP => *len = from + n - *start,
+            _ => merged.push((from, n)),
+        }
+    }
+    merged
+}
 fn delta_write(as_read: &Option<Vec<u8>>, at: usize, after: &[u8]) -> bool {
     let Some(as_read) = as_read else {
         return false;
@@ -1410,9 +1431,14 @@ fn delta_write(as_read: &Option<Vec<u8>>, at: usize, after: &[u8]) -> bool {
     if runs.len() < 2 || changed * 2 >= after.len() {
         return false;
     }
-    for &(from, n) in &runs {
-        let to = from + n;
-        crate::host::shaders_write(at + from, &after[from..to]);
+    let merged = merged_delta_runs(&runs);
+    if merged.len() > DELTA_RUNS {
+        // Too many calls: the whole stretch as one write, what the caller
+        // would do without the delta.
+        return false;
+    }
+    for &(from, n) in &merged {
+        crate::host::shaders_write(at + from, &after[from..from + n]);
         crate::watch::writing(at + from, n);
         crate::host::write_mapped((at + from) as *mut u8, after[from..].as_ptr(), n);
     }
@@ -1459,6 +1485,19 @@ mod difference_tests {
         assert_eq!(last_difference(&a, &b), Some(64));
     }
 
+    /// Runs closer than the gap are written as one call; runs further apart
+    /// keep their own, so a storm of small writes becomes a few bigger ones.
+    #[test]
+    fn nearby_delta_runs_are_written_as_one() {
+        let runs = [(3, 2), (10, 1), (3000, 4), (3600, 1)];
+        assert_eq!(
+            super::merged_delta_runs(&runs),
+            vec![(3, 8), (3000, 4), (3600, 1)],
+            "the 512-byte gap joins 3..5 and 10; 3000 and 3600 stay apart"
+        );
+        assert_eq!(super::merged_delta_runs(&[(7, 1)]), vec![(7, 1)]);
+        assert_eq!(super::merged_delta_runs(&[]), vec![]);
+    }
     /// The delta landing's runs are exactly the bytes that differ, in order,
     /// with runs split by bytes that stay equal.
     #[test]

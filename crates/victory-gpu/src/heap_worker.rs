@@ -257,6 +257,7 @@ pub(crate) fn make_way() -> bool {
 }
 
 fn worker() {
+    crate::stats::thread_started("victory-heap");
     let Some(job) = JOB.get() else {
         return;
     };

@@ -3851,6 +3851,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    crate::stats::thread_started("victory-late-wait");
     let Some(host) = host() else {
         return;
     };
@@ -3974,6 +3975,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    crate::stats::thread_started("victory-relay");
     let Some(host) = host() else {
         return;
     };

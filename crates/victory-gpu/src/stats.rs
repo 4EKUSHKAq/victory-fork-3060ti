@@ -135,8 +135,7 @@ fn thread_times() -> HashMap<u32, u64> {
 }
 
 /// This process's committed memory and the PC's free physical memory, MB.
-fn memory() -> (u32, u32) {
-    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+fn memory() -> (u32, u32) {    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
@@ -251,8 +250,32 @@ impl Engines {
     }
 }
 
+/// The managed threads that registered a name, by tid (for the load line
+/// only: [`thread_started`] at a thread's start).
+static NAMES: Mutex<Vec<(u32, &'static str)>> = Mutex::new(Vec::new());
+
+/// Registers the calling thread under `name`, so the load line can say which
+/// thread was the busiest: Round 9 added it because the figures named only a
+/// percentage (coolfox-perf had to guess the thread).
+pub(crate) fn thread_started(name: &'static str) {
+    // SAFETY: a plain call.
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    NAMES.lock().unwrap_or_else(|e| e.into_inner()).push((tid, name));
+}
+
+/// The name of thread `tid` for the load line: its registered name and the
+/// tid, or the tid alone for a thread that did not register.
+fn thread_name(tid: u32) -> String {
+    let names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    match names.iter().find(|(id, _)| *id == tid) {
+        Some((_, name)) => format!("{name} tid {tid}"),
+        None => format!("tid {tid}"),
+    }
+}
+
 /// The thread: a look a second, for as long as the process runs.
 fn run() {
+    thread_started("victory-stats");
     let mut engines = Engines::open();
     if engines.is_none() {
         tracing::info!("the system's counters of the card's engines did not open: the corner box shows no card load");
@@ -277,14 +300,15 @@ fn run() {
             _ => 0.0,
         };
         let cores = now.2.saturating_sub(last.2) as f64 / wall;
-        let top_thread = now
+        // The busiest thread and which it is: the load line names it, so a
+        // thread near 100 % can be recognized and a port can target it.
+        let (top_cpu, top_tid) = now
             .3
             .iter()
-            .map(|(id, &t)| t.saturating_sub(last.3.get(id).copied().unwrap_or(t)))
+            .map(|(id, &t)| (t.saturating_sub(last.3.get(id).copied().unwrap_or(t)), *id))
             .max()
-            .unwrap_or(0) as f64
-            / wall
-            * 100.0;
+            .unwrap_or((0, 0));
+        let top_thread = top_cpu as f64 / wall * 100.0;
         let looked = engines.as_mut().and_then(Engines::look);
         let (gpu_all, gpu_ours) = match &looked {
             Some(e) => (Some(busiest(e, None).0), Some(busiest(e, Some(pid)).0)),
@@ -316,11 +340,12 @@ fn run() {
             };
             tracing::info!(
                 "the machine's load over the last second (the corner box's figures): processors {:.0} % busy, all programs; this \
-                 process kept {:.1} of {processors:.0} processors busy, its busiest thread {:.0} % of one; the card's engines, all \
+                 process kept {:.1} of {processors:.0} processors busy, its busiest thread {:.0} % of one ({}); the card's engines, all \
                  programs: {}; this process's: {}; this process has {} MB committed, the PC {} MB of memory free",
                 stats.cpu_all,
                 stats.cores,
                 stats.top_thread,
+                thread_name(top_tid),
                 kinds(None),
                 kinds(Some(pid)),
                 stats.ram_ours_mb,

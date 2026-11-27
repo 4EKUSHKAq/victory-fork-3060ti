@@ -829,6 +829,17 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
+/// `VICTORY_DELTA_LAND=1`: a merge writes only the runs of the stretch that
+/// differ from the title's bytes as read, instead of the whole stretch from
+/// its first to its last difference (coolfox-perf: the landing's read and
+/// write of whole stretches is the relay's cost; the XCL idea of a write that
+/// touches only what changed, xcl #2952 п.5). Off by default (the paired A/B
+/// in Round 9 decides).
+pub(crate) fn delta_land() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DELTA_LAND").is_some_and(|v| v == "1"))
+}
+
 /// The submission being prepared (its number among those started): what
 /// [`Shadow::writing`] counts a declared range for ([`Flights`]).
 static PREPARED: AtomicU64 = AtomicU64::new(0);
@@ -1385,6 +1396,29 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| chunk * DIFF_CHUNK + i)
 }
 
+/// With [`delta_land`]: writes only the runs of the merged stretch `after` at
+/// title address `at` that differ from `as_read` (the bytes as read before the
+/// merge), when that is a real delta: more than one run and under half the
+/// stretch. False when the whole stretch should be written as before (one
+/// change, or most of it); the bytes the caller then writes are the same.
+fn delta_write(as_read: &Option<Vec<u8>>, at: usize, after: &[u8]) -> bool {
+    let Some(as_read) = as_read else {
+        return false;
+    };
+    let runs = changed_runs(after, as_read);
+    let changed: usize = runs.iter().map(|&(_, n)| n).sum();
+    if runs.len() < 2 || changed * 2 >= after.len() {
+        return false;
+    }
+    for &(from, n) in &runs {
+        let to = from + n;
+        crate::host::shaders_write(at + from, &after[from..to]);
+        crate::watch::writing(at + from, n);
+        crate::host::write_mapped((at + from) as *mut u8, after[from..].as_ptr(), n);
+    }
+    true
+}
+
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
@@ -1423,6 +1457,22 @@ mod difference_tests {
         b[64] = 1;
         assert_eq!(first_difference(&b, &a), Some(32));
         assert_eq!(last_difference(&a, &b), Some(64));
+    }
+
+    /// The delta landing's runs are exactly the bytes that differ, in order,
+    /// with runs split by bytes that stay equal.
+    #[test]
+    fn delta_landing_runs_are_the_stretches_that_differ() {
+        let before = [0u8; 64];
+        assert!(super::changed_runs(&before, &before).is_empty());
+        let mut after = before;
+        after[3] = 1;
+        after[4] = 2;
+        after[10] = 3;
+        after[63] = 4;
+        assert_eq!(super::changed_runs(&after, &before), vec![(3, 2), (10, 1), (63, 1)]);
+        let shorter = &after[..50];
+        assert_eq!(super::changed_runs(shorter, &before[..50]), vec![(3, 2), (10, 1)]);
     }
 }
 
@@ -1503,6 +1553,7 @@ fn workers() -> &'static Workers {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::stats::thread_started("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -2085,7 +2136,7 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     if changed_runs_wide_on() { changed_runs_wide(now, was) } else { changed_runs_bytes(now, was) }
 }
 
@@ -3182,9 +3233,14 @@ impl Shadow {
         }
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = merge_race_on().then(|| title.clone());
+        let as_read = (merge_race_on() || delta_land()).then(|| title.clone());
         if !merge_piece(now, held, title) {
             return 0;
+        }
+        if delta_land() && delta_write(&as_read, start + at, title) {
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+            return n;
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_quiet(start + at, &title[..]) {
@@ -4145,7 +4201,7 @@ impl Shadow {
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = (mapped && (merge_race_on() || delta_land())).then(|| title.clone());
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -4155,6 +4211,11 @@ impl Shadow {
         }
         if !mapped || !changed {
             return 0;
+        }
+        if delta_land() && delta_write(&as_read, start + at, &title[..]) {
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+            return n;
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_quiet(start + at, &title[..]) {

@@ -2325,3 +2325,108 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 6. **Сцен-матчевый A/B** против `8eb61a6`/`r7a` (лодочная сцена, один маршрут), чтобы отделить эффект шейдерного пакета от разницы маршрутов; проверить `VICTORY_MESH_LAUNCH=0`/`CARD_HASH_WIDE=0` при просадке тяжёлых кадров.
 7. **Series S**: композита двух plane'ов в этой ветке нет (нужен мерж `feat-series-s-upscaler` #798/#1081); force-1080p на Series S — output 1080p, но FSR4-путь по-прежнему чёрный (pre-existing).
 8. Ветка запушена в `myfork` (`https://github.com/4EKUSHKAq/victory-fork-3060ti/tree/feat-r8-1080p-and-kelvaroq-full`, PR-create: `.../pull/new/feat-r8-1080p-and-kelvaroq-full`), `git push` exit 0, remote SHA сверен; режим — **Series X**. После успешного `git push` — штатное выключение ПК (`shutdown /s /t 60`).
+
+## §31. Раунд 9 — research (код не менялся): покрытие **7/7** звёзд (`xcl` + `XSEmu` впервые), дельта fxceless `9a9091d1` («Ray tracing runs»), DXR-док, CPU-аудит coolfox; сводный план Раунда 10
+
+Разведка 2026-11-27 05:00–06:20Z (10:00–11:20 +05:00). `crates/` **не менялся**, `HEAD 84df20a`, рабочее дерево чистое, тесты не запускались (658 passed с Round 8 остаются в силе), шейдерный кэш не тронут. Все отчёты — в `C:\GTA6_Port\audit\round9\`.
+
+### 31.1. Покрытие и агенты
+
+- `gh api user/starred` = **ровно 7 репозиториев** (других звёзд нет): `fxceless/victory-fork`, `Marvisak/VIctory`, `stellarr-studio/kelvaroq`, `Belobug/VIctory-Belobug-AMD`, `uiliannn/VItoriaBr`, **`xcl-dev/xcl`**, **`zortos293/XSEmu`**.
+- Первый проход Round 9 покрыл только 5 из AGENTS п.8. `xcl` изучался лишь в Round 16 (§16.6, один reference-PR), `XSEmu` **не упоминался ни разу**. Пробел закрыт в этом раунде; заодно перепроверена дельта по 5 репо.
+- Агенты и отчёты: `r9-fx-marvisak` → `r9-fx-marvisak.md` (35 КБ), `r9-bel-vitoria` → `r9-bel-vitoria.md` (39 КБ), `r9-kelvaroq-scan` → `r9-kelvaroq-scan.md` (36 КБ), `r9-dxr-doc` → `r9-dxr-doc-study.md` (84 КБ), `r9-refresh5` → `r9-refresh-5.md` (16 КБ), `r9-xcl` → `r9-xcl.md` (39 КБ), `r9-xsemu` → `r9-xsemu.md` (42 КБ), фоновый `coolfox-perf` → `C:\GTA6_Port\coolfox\perf\audit-top-thread.md` (8 КБ). Сырые артефакты: `raw\{xcl,xsemu,refresh5}\` — 143 файла, ~11 МБ.
+
+### 31.2. Пять известных репо — что берём (перенос из первого прохода)
+
+| Приоритет | Источник | Суть | Применимость / статус |
+|---|---|---|---|
+| **P0** | fxceless `81d54b06f7` (PR #1407 CLOSED, правка влита в main) | `shadow.rs`: `(at - (start+at) % PIECE).max(from)` → `saturating_sub`; big-compare ≥16 МиБ не сравнивался | 1 строка, **наша строка на месте**; правка без кэша |
+| **P0** | fxceless #1380 (merged 26.11) | `clzero` на guarded/uncommitted линии — крах `0xC000001D` | main-код ложится, отвергается только тестовый хунк |
+| **P0** | env A/B | `VICTORY_TILES_SMALL_WHEN_FULL_MB` **256 → 512** (upstream default; r8final `tiles_black` 432/868) | без кода, 2×300 с |
+| **P0** | fxceless `a91816384` LDS init hoist (в main с 03:39Z) | вода: min/max init пропускался на early-return → тёмные пятна | ~200 строк + **re-warm cache**; дешёвый пред-A/B — не гнать два водных хэша `5dc3b259…`/`6f225b64…` wave-wide |
+| **P1** | fxceless #1392 (merged 26.11) | текстура «partly mapped, never filled» остаётся нулями при `TEXTURE_NO_WAIT=1` (наш default) | ручной порт |
+| **P1** | VItoriaBr #72 | placed-UAV aliases (2D/array/3D) | `apply --check` чистый, кэш не нужен; тест вода/H-B |
+| **P1** | Belobug #449 / #414 | `legal_state` для обеих сторон barrier / `FRAME.load` до swap | apply clean, без кэша |
+| **P1** | Belobug #396 / #470, VItoriaBr #59 | перепроверка in-place текстур после ~572 кадров / detile-retry / mesh `exp prim` 9-бит | ручной порт; #59 — re-warm |
+| **P1** | fxceless `ff1776b79` | `VICTORY_DUMP_REFUSED` — дамп отказов (15 строк, диагностика) | в main, пушем не тронут |
+| **P2** | fxceless #1419 / masked patch/lean (#1352 merged, −13 мс card) | paired wave64 / ~490 строк, конфликты | отложено |
+| watch | Marvisak / kelvaroq | merge нет; у Belobug 5 новых open-PR #476–#480 (WC-копии, write guard, geometry, adaptive pools) | только наблюдение |
+
+### 31.3. fxceless — дельта **после** отчёта (refresh5)
+
+- `main`: `674290601` → **`9a9091d180f0`**, 2026-11-27T05:28:07Z, «Ray tracing runs: the structure builder no longer stalls the title; rays see the structures» (10 файлов, +522/−59, без PR). Внутри: (1) sync title-памяти по адресам — каждый список синхронизирует только копии своих dispatch'ей, лимит 1023→4095, `VICTORY_MEMORY_SYNC_ALL`; (2) written-page notes — store/atomic помечают 64-КиБ страницу, назад копируются только они (`shadow.rs::pull_back`); (3) RT-адрес в `Location` view (было 0 → пустой узел); (4) instance/procedural-ноды → all ones как AMD GPURT.
+- **Следствие:** краш `XboxBvhBuilder.dll` через 30–40 с — это **watchdog титула** (запись в 0), а не битый указатель; **RT-тени/свет теперь видны**, но **0.2–3 fps** (до 8 ГБ копий/кадр, ~150 мс CPU). README-статус 06:30Z. Для нас: BVH/RT — **watch only**, в Round 10 не брать (нужны paired wave64 + фикс 3 refused + memory-датапас; у апстрима fps тоже неприемлемый).
+- Статусы: #1380/#1392/#1352 merged 26.11 23:06Z; **#1407 CLOSED без merge**, но правка в main коммитом `81d54b06f7` (`at.saturating_sub(...)` — проверено по файлу); `ff1776b79`, `a91816384` в main с 03:39Z. Новые микро-CPU-кандидаты: #1436 (`stage_spans` Vec alloc), #1427 (`Shadow::card_merge_relay`).
+- Остальные 4 без кода: HEAD'ы совпадают со снимками отчётов — Marvisak `63bcca43c6`, kelvaroq `e062a82e04`, Belobug `4eb6cfdf9e`, VItoriaBr `1361e190b7` (у VItoriaBr `pushedAt` = **26.11 04:09Z**, не 27.11; после 04:00Z активности нет).
+
+### 31.4. `xcl-dev/xcl` (GPL-2.0, Rust; 8 639★, 1 204 форка, создан 2026-11-20 — вся история 7 суток; HEAD `c2ee10e4e905`, 1 587 open PR, 333 issue)
+
+Прямой перенос кода **запрещён лицензией** (GPL-2.0-only несовместим с нашим GPL-3.0-or-later) — только идеи, алгоритмы, цифры. Законный код — `OpenScarlett` (MIT, C++20, `dxr_hardware.cpp`) и `locum` (MIT, Rust, capture/replay с `verify --times`).
+
+1. **№1 под наш copy-back — `XCL_MAP_ASYNC` (#2952 п.5) + #1993.** Их профиль на NVIDIA — наш 1:1: GPU занят 52–56 %, CPU-bound, потоки тайтла стоят в `Map → sparse::readback_now → wait_own_fence`, ~24 000 `Map`/10 с; каждый `Map` писал свежий copy-back и **ждал его на CPU**. Фикс «ждать только перекрывающиеся копии»: **5.5 → 7.6 presents/s (+38 %), GPU busy 52 → 78 %**. Это прямой аналог наших `copy-back 55–76 мс` при GPU busy 56–69 %.
+2. **`WaveSize(64)` у них решён, а не отказан** — `docs/wave64-on-wave32.md` (25,5 КБ, в main): на адаптере с `WaveLaneCountMax<64` (наш RTX 3060 Ti, Ampere 32..32) `[WaveSize(64)]`-PSO отвергается при создании — **ровно наши 3 отказа**. Решение: `[WaveSize(32)]` + две hardware-половины + обмены; **split** (у нас уже есть в `emit/lower.rs:1344+`) и **packed** (1 host-wave32, lane i = console-lanes i и i+32 — **формы у нас нет**); liveness масок снижает worst-case **3.90–4.14× → 1.07–1.16×**. Риск: #1727 GPU hangs на RTX 5070; #2964 fail-closed по таймауту. Бонус — разблокирует наш `VICTORY_BVH_BUILDER`.
+3. **Пайплайн-шторм: рычаг — размер DXIL, не воркеры.** Cold-компиляция ~`N^1.47`, 12 driver-слотов заняты, ~4 МБ DXIL ≈ 951 с; #2080 (merged): split по CFG-границам → **14–23 с → 2.2–2.5 с** ценой 1.57–2.06× runtime. Политика: `XCL_HUGE_PSO_CONCURRENCY=1` (огромные PSO **по очереди**), ≥4 МиБ — one-wide lane, гейт по 3 ГБ commit, потолок `XCL_PIPELINE_MAX_KB`=8 МиБ. Наши «14 пайплайнов по 5–7 с, wanted at once» — вероятно параллельная компиляция, душащая драйвер.
+4. **Подготовка до старта + whole-form-first** (#2555 merged, #2952 п.3): whole-форма split-программы строится **первой** → «0 chained dispatches в каждом world-прогоне»; иначе **468 с ожиданий на 20 формах**. #2371: offline whole-pipeline blobs → **4.07 → 0.52–0.60 с** на PSO, smoke 1020 → 1266 кадров.
+5. **VRAM: готовая политика 75/85/92 %** (#2385/#2968): по заполнению бюджета кап стороны 2048/1024/512 + mip-clamp через `ResourceMinLODClamp` (tiled tier 2 читает нули), RT/depth/UAV не трогать. На 8-ГБ карте pages **3.2 → 2.29 ГБ**, VRAM **10.2 → 9.0 ГБ**. Наши 7.12/8.19 ГБ — их «>85 %» бакет; чёрные тайлы лечатся clamp'ом, а не отказом.
+6. **Наши host-copies, вероятно, не memcpy, а цена imported heap.** #2844 (merged, 4.9× FPS): GPU-loads/atomics на `OpenExistingHeapFromAddress` на NVIDIA в **8–22× медленнее** driver `CUSTOM` L0 heap (проба 573 vs 44.7 нс/итер.); окно в CUSTOM L0 → **0.62 → 3.03 FPS**, mixed-окно #2938 → **0.58 → 25.28 FPS (43×)**, PCIe −2/3. CPU-чтения BAR шли 12–84 МиБ/с → читать через COPY-очередь.
+7. **Модель стоимости «лука» (#582):** `GetWriteWatch` = **1.15 мкс + 0.45 мс/ГиБ**; план (64-КиБ read-only блоки + vectored handler) → **0.83 → 0.02 мс**. Если наши 55–84 мс — скан «что изменил CPU», цель — единицы мс.
+8. **RT: xcl остаётся на CPU-эмуляции узлов BVH, host-DXR не реализован** (#1751 — проект с разобранными `BATCHED_DESC2`/rehydrate/layout). Ключевое: их `XboxBvhBuilder.dll` **запускается нативно**, наша нет → развилка «собрать console-BVH самим» либо host-DXR, не быстрый фикс. Ещё #1412: отказы надо кэшировать по capability («boot pays for the same refusals every run») — про наши 3.
+
+**Вывод:** xcl даёт существенно новое против §16.6 — три идеи доехали до main с замерами (#2844, #2555, #2371), #2938 показывает запас 43×, появились спека wave64 и модель write-watch.
+
+### 31.5. `zortos293/XSEmu` (GPL-2.0-only заявлена, но 6 файлов GPL-3.0-or-later; Rust 11.7 МБ / 313 `.rs`; 732★, создан 2026-11-23, HEAD `439a152322`, 30 коммитов, 12 merged PR, 0 релизов, 4 шумных issue)
+
+- **Тот же класс и та же игра:** Wine-подобный HLE-раннер Xbox Series X|S, ответвление `ivall/xcl`; дефолтная цель — **GTA VI, TitleId `7952987A`** (`hle/d3d12x/title_gta6.rs`), прогоны `play-45…play-98`, мир на `play-87n`; тот же `shaders.rpf` (26 503 записи).
+- **RT у них принципиально иначе:** host DXR не используют, RT по умолчанию **выключен** (`RaytracingTier`=0, `CreateStateObject`→`E_NOTIMPL`), билдер all-or-none; GTA VI никогда не спрашивает `OPTIONS5`. Наши RT-проблемы они **не решают**; ценность — память/VRAM/волны/пайплайны.
+- **P0 `docs/wave64-on-wave32.md`** — полная спека split+packed, обмены, барьеры/счётчики, hazards, `upper_lanes` (13 210 wave64 VS/PS, 749 программ с lane≥32), liveness масок; подтверждает наш отказ 3 CS и блокировку BVH-билдера.
+- **P0/P1 `image_writeback.rs`** («ZOR-603») — точный ленивый page-guard writeback GPU-записанных изображений: авторитет = фактическая сабмиссия, захват физстраниц, guard на адрес и алиасы, отдача только по CPU-чтению, тайлинг в консольный layout, 23 счётчика отказов. Это **порт нашего же `texback.rs`** (fxceless PR #999) с улучшением; файл GPL-3.0-or-later ⇒ **обратный перенос законен с provenance**. Их пример — **water height map, по которому плавают лодки** ⇒ прямо в нашу «воду».
+- **P1 VRAM/тайлинг:** 64-КиБ страницы + алиасинг таргетов по одному адресу + lazy tiles только там, где тексели (retail 5.2 ГБ текстур над 2.9 ГБ страниц) + 1-МиБ slabs (−0.9 ГБ) + residency/evict; их баг «3.5 ГБ адресов → 15 ГБ арен → device removed» — готовые грабли для наших 7.12/8.19 ГБ, чёрных тайлов и placed-UAV alias; GFX10 tiling XOR/PipeConfig (909/912 текстур байт-в-байт) — эталон сверки.
+- **P1 пайплайн-шторм:** present-chain-first (`FFX_*` = 27 FSR4 + RCAS + SPD; «2 из 29 собраны на 451 с за 1 547 ожидающими»), early shaders, stand-in+воркеры+бюджеты, admission (giants ≤3, `30+10·MiB`), манифест+warm-up. У нас **уже зрелее** pipeline library и воркеры ⇒ брать нужно приоритизацию, а не механизм.
+- **Лицензия:** из `crates/xcl/**` — только идеи/факты/форматы с атрибуцией; из 6 GPL-3-файлов (`image_writeback`, `title_gta6`, `pso_manifest/sched/library`, `warm_children`) возможен прямой перенос с provenance-нотой. `title_gta6.rs` целиком не цитировать («Not for a public or shared build»).
+- **XSEmu смотрит в наш репозиторий:** PR #999 → `image_writeback.rs`; CGBJ `f4b48ad` → 6 файлов; их Qt6-лаунчер собирает/запускает `avatarmanz/VIctory-7900XTX`, `DexNom/VIctory`, `kelvaroq` v0.2.0, `cool_fox` @`f4b48ad` и парсит прогресс наших CLI (`victory shaders`, `warm --used`); готовый A/B-набор из 17 `VICTORY_*`-флагов «самой быстрой» конфигурации (9 из 17 уже есть у нас; `RELAY_COPY`, `CARD_STEPS`, `INDIRECT_BATCH`, `MAP_THREADS`, `CARD_AWAKE`, `SHOW_AFTER`, `THIN`, `UPLOAD_AHEAD` — только у cool_fox; `THIN` — NO-GO, см. 31.6).
+- **Вывод:** включать в мониторинг **третьей линией** после Marvisak/fxceless/kelvaroq — единственный, кроме нас, проект, ведущий GTA VI на близком стеке и публикующий решения с числами. Роль — референс-архитектура и чек-лист, не копипаста.
+
+### 31.6. Фоновый `coolfox-perf` — CPU-аудит top-thread (завершился в этом раунде)
+
+Замеры по `play-r8` (наш мир, 3060 Ti): кадр медиана **231,9 мс**; preparing (`victory-submit`, ASYNC_SUBMIT=1) **112,9 мс**, из них copies **80,6 мс / 131–144 МБ**, textures 12,9; лендинг relay **99,7 мс/кадр** (p90 207,5, max 1079); relay ожидание карты/фетчи 27,0/8,3; GPU 33,4 / copy-back wall 71,5; TOP THREAD (stats.rs) медиана **66 %**, p90 **100 %**, ≥87 % в 18,7 % проб; settle-ожидания **0,0 мс**; heap-pass 14,9 (в тяжёлых 42–86).
+- **AVX2-компаратор coolfox — не брать отдельно:** у нас `changed_runs` SSE2, медиана 714 runs / 0,67 МБ/кадр ⇒ выигрыш <1–2 мс; их выигрыш от «pairs dispatch», не от AVX2.
+- **Дельта-возврат (`VICTORY_LAND`) — главный рычаг:** у нас `Shadow::card_merge_relay` на различающийся кусок **читает весь stretch из title-памяти** и пишет обратно весь stretch; многопоточно только сравнение. Точечный порт (без их asm/`land.rs`): считать runs «gpu vs held» и писать только их — **~60–120 строк `shadow.rs`** + флаг + тесты; второй шаг — 3–4 потока (~150 строк `host.rs`). Ожидание: relay-лендинг **~100 → 30–40 мс** (p90 207 — больше), VRAM **0**.
+- **PAGE_PARTS (`3ead56e`):** копировать только записанные 4-КиБ части 64-КиБ страницы («29 МБ записано, копировалось 114 МБ») — наш профиль copies 80,6 мс / 131–144 МБ; ~200 строк `watch.rs`+`shadow.rs`.
+- `thin.rs` — **NO-GO**: это не наш top-поток, отдельная ветка 1,7 тыс. строк, их же прогон на 3060 Ti дал 2–3 fps против наших 6.
+- **До порта — атрибуция top-потока (без кода, 3 пары по 120 с):** `RELAY=2↔0`, `ASYNC_SUBMIT=1↔0`, `HEAP_WORKER=1↔0`; плюс 20 строк — писать tid победителя в `stats.rs`. Нулевые A/B: `VICTORY_COPY_CHANGED=1|alt` (есть, off), `VICTORY_MERGE_GAP=0` vs 64.
+- Всё — только `crates/victory-gpu` (CPU-side), `victory-shader` не трогается ⇒ кэш остаётся валидным; новых device-аллокаций нет.
+
+### 31.7. DXR-документ (`r9-dxr-doc-study`)
+
+Не общая статья «CPU одно / GPU другое», а проект native host DXR для `victory-corgi` (RTX 5090): BLAS/TLAS + DXIL `RayQuery` вместо консольной эмуляции в 64 compute-программах. Подтверждает: наш RT **CPU-bound** из-за host-копий title-памяти; RT-ядра GPU не используются. Но crux — замена traversal-loop в 64 программах (стадия 3 — офлайн-survey, go/no-go), недели работы; у нас 8 ГБ (пик 7.12/8.19, запас ~1 ГБ), builder на NVIDIA нестабилен, нашего `native_rt.rs`/RayQuery/DXR-типов **нет**. **Native DXR сейчас не планировать.** Дешёвые шаги: офлайн-survey 64 `image_bvh*`/live-outs; `VICTORY_BVH_HOLD=1` A/B; короткий builder+quarantine с DRED; счётчики by-address. Поправка: 3 refused compute — **не builder** (см. 31.10).
+
+### 31.8. Сводный план Раунда 10 (после всех источников)
+
+| # | Приоритет | Что делать | Источник | Ожидаемый эффект | Риск |
+|---|---|---|---|---|---|
+| 1 | **P0** | copy-back не ждать на CPU: аналог `XCL_MAP_ASYNC` (ждать только перекрывающиеся копии) | xcl #2952 п.5 / #1993 | наш copy-back 55–76 мс ↓; GPU busy ↑ | средний |
+| 2 | **P0** | `shadow.rs` compare `saturating_sub` | fxceless `81d54b06f7` | корректность big-compare ≥16 МиБ | низкий |
+| 3 | **P0** | env A/B `TILES_SMALL_WHEN_FULL_MB` 256↔512 | Round 9 | `tiles_black` 432/868 ↓ | нулевой |
+| 4 | **P0** | wave64 → 3 refused CS: начать с дешёвой ISA-классификации, затем **packed**-форма + liveness масок (split уже есть) | xcl doc + XSEmu doc | разблокирует 3 CS и BVH-билдер; 1.04–1.16× overhead | высокий |
+| 5 | **P0/P1** | точный ленивый writeback по авторитету сабмиссии (`texback` → submission-authority+guard) | XSEmu `image_writeback.rs` (GPL-3, производный от нашего #999) | copy-back точнее; вода/height map | средний |
+| 6 | **P1** | VRAM-политика 75/85/92 % → cap 2048/1024/512 + mip-clamp | xcl #2385/#2968 | чёрные тайлы, пик 7.12/8.19 | средний |
+| 7 | **P1** | дельта-лендинг (писать только различающиеся runs) + PAGE_PARTS | coolfox-perf | relay 100 → 30–40 мс; copies −объём | средний |
+| 8 | **P1** | проверить imported heap vs `CUSTOM` L0 (8–22× медленнее GPU-loads) | xcl #2844/#2938 | возможно, объясняет наши copies | низкий (A/B) |
+| 9 | **P1** | present-first приоритизация PSO (`FFX_*`/RCAS/SPD) | XSEmu `title_gta6` | −50…−80 % first-frame на 14 PSO | средний |
+| 10 | **P1** | мелкие чистые порты: Belobug #449/#414/#396/#470, VItoriaBr #72/#59, #1380, #1392 | Round 9 | корректность/стабильность | низкий |
+| 11 | **P1** | сериализация huge-PSO + потолок DXIL (`XCL_HUGE_PSO_CONCURRENCY`, `XCL_PIPELINE_MAX_KB`=8 МиБ) | xcl #2080 | пайплайн-шторм 14×5–7 с | средний |
+| 12 | **P2** | `ff1776b79` `VICTORY_DUMP_REFUSED`, #1436/#1427 микро-CPU | fxceless | диагностика | низкий |
+| 13 | watch | RT: fxceless `9a9091d1` (0.2–3 fps), native DXR, XSEmu RT-off bench (`VICTORY_RT=off`), 17-флаговый чек-лист | xcl/XSEmu/fxceless | понимание цены RT | — |
+| 14 | NO-GO | `thin.rs`, AVX2-компаратор отдельно, RT-раунд сейчас | — | — | — |
+
+### 31.9. Артефакты
+
+- Отчёты: `audit\round9\r9-{fx-marvisak,bel-vitoria,kelvaroq-scan,dxr-doc-study,refresh-5,xcl,xsemu}.md`; CPU-аудит: `C:\GTA6_Port\coolfox\perf\audit-top-thread.md`.
+- Сырое: `audit\round9\raw\` — 472+ файла (repo evidence, диффы, `dxr-doc.md`, `xcl\` 50 файлов, `xsemu\` 52 объекта + tarball HEAD, `refresh5\` 51 файл).
+- Игровая сессия пользователя: `C:\GTA6_Port\play-r8\` (596 с, 16/38 удачных кадров, пик VRAM 7 121 МиБ, 0 ERROR/device-loss).
+
+### 31.10. Поправка к §30.9 п.4 и следующий шаг
+
+- **Поправка:** три refused compute-пайплайна (`2da4beb386509b77`, `6b82bc7d22016cb5`, `02384a60fda6f2d0` = `alphaResolveCS_AlphTransmissionPrefilterMip`, `vfx_triangleClipCS_CollectTriangles_Meshlets`, `vfx_triangleClipCS_DefragHeap_ComputeRelocations`) — это **не XboxBvhBuilder**, а `WaveSize(64)`-отказ `CreateComputePipelineState` из `shaders.rpf`. Теперь подтверждено спекой wave64 (31.4/31.5): на 32-полосном адаптере `[WaveSize(64)]` compute-PSO отвергается. Лечится wave64-портом, а не native DXR.
+- Предложение: расширить AGENTS п.8 с 5 до **7** репозиториев (`xcl` — только идеи, `XSEmu` — третья линия, GPL-3-файлы — с provenance), чтобы разрыв не повторился.
+- Код не менялся; следующий шаг — по команде пользователя: port P0-1/P0-2/P0-3 (copy-back wait, saturating_sub, tiles A/B) отдельными коммитами с `cargo check/test` и парным A/B.

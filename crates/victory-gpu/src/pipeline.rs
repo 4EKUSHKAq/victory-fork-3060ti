@@ -638,7 +638,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 /// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a
 /// group, which a host of 32-lane waves gets in the wave-wide form only
 /// (the 4 and 7 branches taken wave-wide). In that form they leave whole
-/// tiles of open water dark — around boats, along shores, under bridges —
+/// tiles of open water dark вЂ” around boats, along shores, under bridges вЂ”
 /// and took about 15 ms of the card a frame on an RTX 5070 (25 fps with
 /// them, 30 without, the blocks gone; trustno1-coder/VIctory-NVIDIA, commit
 /// 35c156087e, and fxceless/victory-fork's README of 2026-11-27 names the
@@ -646,6 +646,58 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 /// its own depth (darker, bluer) and no blocks; `VICTORY_WATER_LIGHT=1`
 /// runs them as before.
 const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+/// Shader hashes whose pipelines are left out unless
+/// `VICTORY_LEAVE_OUT` says others: the decal heap's
+/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0) and the heat-haze /
+/// in-scattering pass (731a39171b568298).
+///
+/// The decal heap's defragmentation ran its relocations on the console's
+/// wave-wide form: 11.85 ms of the card a frame in the first gameplay area
+/// (`trustno1-coder/VIctory-NVIDIA`, `crates/victory-gpu/src/pipeline/make.rs`
+/// and its `scripts/play-foxhound.ps1`, GPL-3.0-or-later; earlier their
+/// README named 5.6 ms). The heat-haze pass smears blocks of pixels, also on
+/// water (same source, `VICTORY_LEAVE_OUT` in their launcher).
+///
+/// Left out here is a pipeline that is never made: its draws and dispatches
+/// are dropped for the whole run and the count says so (`left out on purpose`
+/// in the frame line). The decal heap's records then are not moved by its
+/// own pass (sound: relocations only compact it). `VICTORY_LEAVE_OUT=none`
+/// runs everything; a comma-separated list of 16-digit hashes replaces the
+/// default set.
+#[cfg(windows)]
+const LEAVE_OUT_BY_DEFAULT: [&str; 2] = ["02384a60fda6f2d0", "731a39171b568298"];
+
+/// `VICTORY_LEAVE_OUT`'s hashes: unset, [`LEAVE_OUT_BY_DEFAULT`]; `none` or
+/// empty, none; else the 16-digit lowercase hashes it lists.
+#[cfg(windows)]
+fn parse_leave_out(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return LEAVE_OUT_BY_DEFAULT.iter().map(|hash| (*hash).to_owned()).collect();
+    };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// [`parse_leave_out`] of the environment, once per run.
+#[cfg(windows)]
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let asked = std::env::var("VICTORY_LEAVE_OUT").ok();
+        let hashes = parse_leave_out(asked.as_deref());
+        tracing::debug!(?hashes, "shaders whose pipelines are left out for the whole run");
+        hashes
+    })
+}
 
 /// What the host and the switches allow, asked once per run.
 #[cfg(windows)]
@@ -694,7 +746,10 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 #[cfg(windows)]
-fn left_out_with(s: &Skipping, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+fn left_out_with(s: &Skipping, leave_out: &[String], shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out.is_empty() && shaders.iter().any(|sh| leave_out.contains(&sh.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     if !s.water_light && s.host_wave == 32 && shaders.iter().any(|sh| WATER_LIGHT.contains(&sh.hash.as_str())) {
         return Some(
             "the water's tiled light on a host of 32-lane waves leaves tiles of open water dark \
@@ -717,7 +772,7 @@ fn left_out_with(s: &Skipping, shaders: &[Arc<Shader>]) -> Option<&'static str> 
 /// ([`make::Pending::new`]); the first reason is logged once.
 #[cfg(windows)]
 pub(crate) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    let why = left_out_with(skipping(), shaders)?;
+    let why = left_out_with(skipping(), leave_out(), shaders)?;
     static SAID: Mutex<Option<Vec<&'static str>>> = Mutex::new(None);
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     let said = said.get_or_insert_with(Vec::new);
@@ -1177,17 +1232,43 @@ mod tests {
         let water = fake_shader("compute", WATER_LIGHT[0], b"");
         let other = fake_shader("compute", WATER_LIGHT[1], b"");
         let mut s = switches();
-        assert_eq!(left_out_with(&s, &[water.clone(), other.clone()]), None, "64-lane host runs it");
+        assert_eq!(left_out_with(&s, &[], &[water.clone(), other.clone()]), None, "64-lane host runs it");
         s.host_wave = 32;
-        assert!(left_out_with(&s, &[water.clone()]).is_some(), "32-lane host leaves it out");
-        assert!(left_out_with(&s, &[other]).is_some(), "both programs are left out");
+        assert!(left_out_with(&s, &[], &[water.clone()]).is_some(), "32-lane host leaves it out");
+        assert!(left_out_with(&s, &[], &[other]).is_some(), "both programs are left out");
         s.water_light = true;
-        assert_eq!(left_out_with(&s, &[water]), None, "VICTORY_WATER_LIGHT=1 runs it");
+        assert_eq!(left_out_with(&s, &[], &[water]), None, "VICTORY_WATER_LIGHT=1 runs it");
         s.water_light = false;
         assert_eq!(
-            left_out_with(&s, &[fake_shader("compute", "0123456789abcdef", b"")]),
+            left_out_with(&s, &[], &[fake_shader("compute", "0123456789abcdef", b"")]),
             None,
             "only the two programs are left out"
+        );
+    }
+
+    /// `VICTORY_LEAVE_OUT` leaves the decal heap's defragmentation and the
+    /// heat-haze pass out by default; `none` (or empty) runs everything, and
+    /// a list of 16-digit hashes replaces the default set.
+    #[cfg(windows)]
+    #[test]
+    fn the_decal_defrag_and_heat_haze_are_left_out_unless_asked_else() {
+        let defaults: Vec<String> = LEAVE_OUT_BY_DEFAULT.iter().map(|hash| (*hash).to_owned()).collect();
+        let defrag = fake_shader("compute", LEAVE_OUT_BY_DEFAULT[0], b"");
+        let haze = fake_shader("pixel", LEAVE_OUT_BY_DEFAULT[1], b"");
+        assert!(left_out_with(&switches(), &defaults, &[defrag.clone()]).is_some(), "the defrag");
+        assert!(left_out_with(&switches(), &defaults, &[haze.clone()]).is_some(), "the haze");
+        assert_eq!(left_out_with(&switches(), &[], &[defrag.clone(), haze.clone()]), None, "none runs all");
+        assert_eq!(
+            left_out_with(&switches(), &defaults, &[fake_shader("compute", "0123456789abcdef", b"")]),
+            None,
+            "only the named programs are left out"
+        );
+        assert_eq!(parse_leave_out(None), defaults);
+        assert!(parse_leave_out(Some("none")).is_empty());
+        assert!(parse_leave_out(Some("  ")).is_empty());
+        assert_eq!(
+            parse_leave_out(Some(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,")),
+            ["0123456789abcdef", "0011223344556677"]
         );
     }
 
@@ -1200,22 +1281,22 @@ mod tests {
         let activate = fake_shader("compute", "fedcba9876543210", b"CS_ScreenProbes_ActivateRays");
         let mut s = switches();
         s.water_light = true;
-        assert!(left_out_with(&s, std::slice::from_ref(&resolve)).is_some(), "resolve without BVH");
-        assert!(left_out_with(&s, std::slice::from_ref(&activate)).is_some(), "activate rays without BVH");
+        assert!(left_out_with(&s, &[], std::slice::from_ref(&resolve)).is_some(), "resolve without BVH");
+        assert!(left_out_with(&s, &[], std::slice::from_ref(&activate)).is_some(), "activate rays without BVH");
         assert_eq!(
-            left_out_with(&s, &[fake_shader("pixel", "0123456789abcdef", b"CS_RaytracingResolve")]),
+            left_out_with(&s, &[], &[fake_shader("pixel", "0123456789abcdef", b"CS_RaytracingResolve")]),
             None,
             "a shader of another stage is not named"
         );
         s.rt_resolve = true;
-        assert_eq!(left_out_with(&s, std::slice::from_ref(&resolve)), None, "VICTORY_RT_RESOLVE=1 runs it");
-        assert!(left_out_with(&s, std::slice::from_ref(&activate)).is_some(), "activate still left out");
+        assert_eq!(left_out_with(&s, &[], std::slice::from_ref(&resolve)), None, "VICTORY_RT_RESOLVE=1 runs it");
+        assert!(left_out_with(&s, &[], std::slice::from_ref(&activate)).is_some(), "activate still left out");
         s.bvh_builder = true;
         s.activate_rays = true;
-        assert_eq!(left_out_with(&s, &[resolve, activate]), None, "with the builder both run");
+        assert_eq!(left_out_with(&s, &[], &[resolve, activate]), None, "with the builder both run");
         s.activate_rays = false;
         assert!(
-            left_out_with(&s, &[fake_shader("compute", "fedcba9876543210", b"CS_ScreenProbes_ActivateRays")]).is_some(),
+            left_out_with(&s, &[], &[fake_shader("compute", "fedcba9876543210", b"CS_ScreenProbes_ActivateRays")]).is_some(),
             "VICTORY_ACTIVATE_RAYS=0 leaves it out with the builder too"
         );
     }

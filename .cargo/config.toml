@@ -1,2 +1,15 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# One machine profile: the CPU this fork is measured on is an i5-10600 (6C/12T,
+# AVX2, FMA, BMI2), and the frame is CPU-bound on the submitting thread (the
+# 1080p profile spends 84-112 ms there against 7-14 ms waiting for the card).
+# Building the whole layer for x86-64-v3 lets the scalar-heavy code (descriptor
+# and heap walks, landing dword loops, checksums) use the same instruction set
+# the GPU side's hand-written AVX2 leaves already assume at runtime (safecopy
+# asks for AVX2 before using them). Round 20: the build flag the ported
+# benchmarks name (Belobug #649). VICTORY_SAFE_COPY/land keep their own runtime
+# AVX2 check, but this build itself may emit AVX2 anywhere - do not run it on a
+# CPU without AVX2.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

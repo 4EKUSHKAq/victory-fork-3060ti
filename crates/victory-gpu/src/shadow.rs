@@ -835,15 +835,25 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
-/// `VICTORY_DELTA_LAND=1`: a merge writes only the runs of the stretch that
-/// differ from the title's bytes as read, instead of the whole stretch from
-/// its first to its last difference (coolfox-perf: the landing's read and
-/// write of whole stretches is the relay's cost; the XCL idea of a write that
-/// touches only what changed, xcl #2952 п.5). Off by default (the paired A/B
-/// in Round 9 decides).
+/// `VICTORY_LAND=1` or `VICTORY_DELTA_LAND=1`: a merge writes only the runs
+/// of the stretch that differ from the title's bytes as read, instead of the
+/// whole stretch from its first to its last difference (coolfox-perf: the
+/// landing's read and write of whole stretches is the relay's cost; the XCL
+/// idea of a write that touches only what changed, xcl #2952 п.5).
+///
+/// `VICTORY_LAND` is the name `trustno1-coder/VIctory-NVIDIA`'s `land.rs`
+/// gave such a landing (only what changed, in batched stores; GPL-3.0-or-
+/// later). Its thread pool and its native safe-copy library (AVX2 merge with
+/// fault recovery, `safecopy.rs` + C/asm) are **not** ported here: this is
+/// our batched dword landing under that name, so that an A/B of the idea is
+/// possible. `VICTORY_DELTA_LAND` keeps working. Off by default.
 pub(crate) fn delta_land() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DELTA_LAND").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        ["VICTORY_LAND", "VICTORY_DELTA_LAND"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -928,13 +938,35 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    // A block of 8 bytes the card left as it was held has nothing to merge
+    // (`wrote` is 0 for each of its bytes, so the byte merge would leave them
+    // as they are): passing over it whole is the same result, and a stretch a
+    // shader touched in a few places is mostly such blocks (the idea of
+    // `safecopy::merge`'s 32-byte compares in trustno1-coder/VIctory-NVIDIA,
+    // GPL-3.0-or-later; our port keeps the byte merge, the one path both
+    // switches share).
+    let blocks = n / 8;
+    for b in 0..blocks {
+        let at = b * 8;
+        if now[at..at + 8] == held[at..at + 8] {
+            continue;
+        }
+        for k in at..at + 8 {
+            let wrote = if now[k] != held[k] { 0xffu8 } else { 0 };
+            let merged = (title[k] & !wrote) | (now[k] & wrote);
+            differs |= merged ^ title[k];
+            title[k] = merged;
+            held[k] = (held[k] & !wrote) | (now[k] & wrote);
+        }
+    }
+    for k in blocks * 8..n {
+        let wrote = if now[k] != held[k] { 0xffu8 } else { 0 };
+        let merged = (title[k] & !wrote) | (now[k] & wrote);
+        differs |= merged ^ title[k];
+        title[k] = merged;
+        held[k] = (held[k] & !wrote) | (now[k] & wrote);
     }
     differs != 0
 }
@@ -5452,5 +5484,49 @@ mod write_combined_tests {
         title_memory_write_combined(other, 0x10_0000);
         write_combined_freed(other, 0);
         assert!(!is_write_combined(other as u64, 0x1000));
+    }
+}
+
+#[cfg(test)]
+mod merge_piece_tests {
+    use super::merge_piece;
+
+    /// The block-wise merge gives exactly the result of the byte loop it
+    /// replaced: only the bytes the card wrote (`now` differs from `held`) go
+    /// into title memory and into `held`, and the title's bytes elsewhere stay.
+    #[test]
+    fn the_merge_is_the_byte_loop() {
+        let bytes = |seed: u64, n: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n);
+            let mut s = seed;
+            for _ in 0..n {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                out.push((s >> 33) as u8);
+            }
+            out
+        };
+        for len in [0usize, 1, 7, 8, 9, 31, 32, 33, 100, 4096] {
+            for trial in 0..40u64 {
+                let held0 = bytes(trial * 3 + len as u64, len);
+                // A third of the card's bytes are new (the "shader" wrote).
+                let now: Vec<u8> = held0.iter().map(|b| if b % 3 == 0 { b.wrapping_add(1) } else { *b }).collect();
+                let title0: Vec<u8> = held0.iter().map(|b| b.wrapping_mul(3).wrapping_add(7)).collect();
+                // The byte loop as it was.
+                let (mut held, mut title) = (held0.clone(), title0.clone());
+                let mut differs = 0u8;
+                for k in 0..len {
+                    let wrote = if now[k] != held[k] { 0xffu8 } else { 0 };
+                    let merged = (title[k] & !wrote) | (now[k] & wrote);
+                    differs |= merged ^ title[k];
+                    title[k] = merged;
+                    held[k] = (held[k] & !wrote) | (now[k] & wrote);
+                }
+                let (mut held2, mut title2) = (held0, title0);
+                let out = merge_piece(&now, &mut held2, &mut title2);
+                assert_eq!(out, differs != 0, "len {len} trial {trial}: whether title memory changed");
+                assert_eq!(held2, held, "len {len} trial {trial}: the copy's reference");
+                assert_eq!(title2, title, "len {len} trial {trial}: title memory's bytes");
+            }
+        }
     }
 }

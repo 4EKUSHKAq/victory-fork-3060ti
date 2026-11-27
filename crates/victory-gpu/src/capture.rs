@@ -659,7 +659,15 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Non-finite channels (NaN/Inf): a broken exposure or a bad light image
+    // reads as white and is invisible in low/high; the count says whether it
+    // is there at all (Round 12: the beach overbright, the 1x1 exposure).
+    let not_finite = values
+        .iter()
+        .flatten()
+        .filter(|v| !v.is_finite())
+        .count();
+    tracing::info!(format, low, high, nonzero_percent, not_finite, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
@@ -672,7 +680,10 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
                 } else {
                     [0, 1, 2, 3].map(|i| half(u16_at(b, i)))
                 };
-                tracing::info!(format, x, y, ?texel, "target texel");
+                // The count of non-finite channels goes with the numbers
+                // (a NaN exposure still prints as the texel's value).
+                let not_finite = texel.iter().filter(|v| !v.is_finite()).count();
+                tracing::info!(format, x, y, ?texel, not_finite, "target texel");
             }
         }
     }
@@ -717,6 +728,7 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
                 }
             }
         }
+        let total = (w * h).max(1) as f32;
         tracing::info!(
             format,
             width = w,
@@ -727,6 +739,12 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
             to_24_bits = classes[3],
             larger = classes[4],
             all_ones = classes[5],
+            // The shares that matter for the shadow fallback: a table that is
+            // mostly 0 (fully shadowed) or mostly 0xFFFFFFFF (never written)
+            // is what leaves faces and interiors black when the RT resolve is
+            // off.
+            zero_percent = classes[0] as f32 * 100.0 / total,
+            all_ones_percent = classes[5] as f32 * 100.0 / total,
             highest_below_ones,
             "target values as words"
         );

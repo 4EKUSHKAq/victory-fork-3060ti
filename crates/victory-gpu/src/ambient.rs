@@ -434,6 +434,14 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // Magenta/violet garbage the probes' memory held (green far under red and
+    // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
+    // garbage probes"); the bluer kind (blue over 2.5x green and over red) is
+    // dropped too, since green under red-and-blue is not sky light (the sky
+    // keeps green above 0.4x blue) nor a sunset (blue stays low).
+    // From trustno1-coder/VIctory-NVIDIA 826ba150c8 (GPL-3.0-or-later).
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);

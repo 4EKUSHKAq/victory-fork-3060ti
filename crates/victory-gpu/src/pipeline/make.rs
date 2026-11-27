@@ -171,11 +171,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED, None);
-        if p.graphics.is_none() && compute_waits() {
+        let frame = crate::frame::current();
+        // The first 600 frames (loading) make theirs whatever it costs;
+        // later frames only while this frame is under the compute cap.
+        let early = frame < 600;
+        if p.graphics.is_none() && (early || (compute_waits() && compute_room(frame))) {
             // Made here, or waited for while a worker makes it.
+            let began = Instant::now();
             p.make();
+            if !early {
+                compute_spent(frame, began.elapsed());
+            }
         } else {
-            wait(p, crate::frame::current());
+            wait(p, frame);
         }
     }
     p.made.get()?.as_ref()
@@ -199,6 +207,61 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// The most a frame waits for compute pipelines made at their dispatch
+/// ([`compute_waits`]), over all threads, before its later dispatches go
+/// back to the frame's budget ([`wait`]).
+///
+/// With a new cache the first cutscene met 457 compute programs in one
+/// frame at about a second each: the frame did not end for over 30 s and
+/// the title's own hang watchdog stored to address 0. Capped, the frame
+/// ends and the rest are made by the workers and waited for within the
+/// budget, as before [`compute_waits`]. The check comes before a make, so a
+/// frame can run over by the makes already started on other threads
+/// (seconds each): `VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 8,000 by default,
+/// leaves room for that under the watchdog's 30 s.
+/// Port of fxceless/victory-fork PR #1450 (GPL-3.0-or-later), one file;
+/// adapted to this tree's `ready`, which has no `frame < 600` early rule.
+fn compute_cap() -> Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8_000)
+    }))
+}
+
+/// The frame whose compute waits are counted, and the microseconds counted.
+static COMPUTE_WAITED: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Whether frame `frame` may still wait for a compute pipeline ([`compute_cap`]).
+fn compute_room(frame: u64) -> bool {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 != frame {
+        *w = (frame, 0);
+    }
+    let room = u128::from(w.1) < compute_cap().as_micros();
+    if !room {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                frame,
+                cap_ms = u64::try_from(compute_cap().as_millis()).unwrap_or(u64::MAX),
+                "a frame waited its cap for compute pipelines; the rest wait within its budget (said once)"
+            );
+        }
+    }
+    room
+}
+
+/// Counts a compute wait to `frame`, if that is still the frame counted.
+fn compute_spent(frame: u64, took: Duration) {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 == frame {
+        w.1 = w.1.saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -527,8 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_admission_rechecks_capacity_before_queueing() {
-        let mut queue = Queue::new();
+    fn speculative_admission_rechecks_capacity_before_queueing() {        let mut queue = Queue::new();
         let first = Arc::new(Pending::new(Vec::new(), None));
         let second = Arc::new(Pending::new(Vec::new(), None));
         assert_eq!(queue.push_eager(&first, 0, 0), None);
@@ -537,5 +599,20 @@ mod tests {
         assert_eq!(second.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert_eq!(queue.push(&second, REQUESTED), Some(true));
         assert_eq!(queue.push(&first, REQUESTED), Some(false));
+    }
+
+    /// The compute wait is capped per frame: what the frame waited is
+    /// counted, and once past the cap its later dispatches go to the frame's
+    /// budget instead (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`; fxceless/
+    /// victory-fork #1450).
+    #[test]
+    fn a_frames_compute_waits_are_capped() {
+        // A frame number of this test's own: the counter is shared.
+        let frame = crate::frame::current() + 1_000_000;
+        assert!(compute_room(frame));
+        compute_spent(frame, compute_cap() + Duration::from_millis(1));
+        assert!(!compute_room(frame));
+        // The next frame starts with nothing waited.
+        assert!(compute_room(frame + 1));
     }
 }

@@ -170,6 +170,19 @@ fn pool_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_EXACT_TEXBACK=1`: a read-back writes only the runs of the title
+/// allocation that differ from the bytes already there, and skips the write
+/// when nothing changed, instead of copying the whole allocation over it. The
+/// traffic half of the submission-authority writeback XSEmu's
+/// `image_writeback.rs` grew from our PR #999 (`VICTORY_TEXTURE_BACK` already
+/// decides *which* submissions' writes are copied back: only textures their
+/// shaders write, `Host::texture_written`); its page-guard half is not ported.
+/// Off by default (the paired A/B in Round 9 decides).
+fn exact_texback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_TEXBACK").is_some_and(|v| v == "1"))
+}
+
 /// The most bytes of read-back buffers kept spare (`VICTORY_READBACK_POOL_MB`).
 fn spare_most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
@@ -209,6 +222,10 @@ fn read_back_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resou
     SPARE_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some((buffer, size))
 }
+
+/// Since the start with `VICTORY_EXACT_TEXBACK`: readbacks skipped as
+/// unchanged, bytes written as deltas, readbacks written as deltas.
+static EXACT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
@@ -322,6 +339,9 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    // With `VICTORY_EXACT_TEXBACK`: the bytes the title's memory holds now,
+    // to write back only what the tiling really changed.
+    let as_read = exact_texback().then(|| tiled.clone());
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -346,6 +366,31 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
+    if let Some(as_read) = &as_read {
+        let runs = crate::shadow::changed_runs(&tiled, as_read);
+        if runs.is_empty() {
+            let skipped = EXACT[0].fetch_add(1, Ordering::Relaxed) + 1;
+            if skipped.is_power_of_two() {
+                tracing::info!(skipped, bytes = size, "texture readbacks skipped as unchanged (VICTORY_EXACT_TEXBACK)");
+            }
+            return;
+        }
+        let changed: usize = runs.iter().map(|&(_, n)| n).sum();
+        if runs.len() > 1 && changed * 2 < size {
+            for &(from, n) in &runs {
+                crate::host::copy_mapped((at + from) as *mut u8, tiled[from..].as_ptr(), n, true);
+            }
+            let written = EXACT[1].fetch_add(changed as u64, Ordering::Relaxed) + changed as u64;
+            EXACT[2].fetch_add(1, Ordering::Relaxed);
+            if written.is_multiple_of(4 << 20) {
+                tracing::info!(
+                    bytes = written,
+                    "texture readbacks written as deltas (VICTORY_EXACT_TEXBACK)"
+                );
+            }
+            return;
+        }
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {

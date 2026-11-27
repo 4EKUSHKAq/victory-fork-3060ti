@@ -384,3 +384,71 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 
 - Ветка **`feat-r10-water-heapcap-and-1440p`** запушена в `myfork` (`4EKUSHKAq/victory-fork-3060ti`); локально = remote; `victory-shader` и кэш шейдеров целы.
 - Round 11 (по приоритету): (1) визуальный тюнинг `AMBIENT_SPECULAR` (0.6/0.25, затем `AMBIENT_SPECULAR_ALPHA=1` на воде) и `AMBIENT 0.8→0.6` — убрать пересвет/пурпур; (2) `native_1440p` скан-аут резервация (−34 MB) через `victory-formats` размер текстуры; (3) DLSS SR по плану `audit\dlss-prep.md` (без правок victory-shader) — сначала `ffxDispatch`-перехват и `sl.interposer`, FG не трогать; (4) разбор RT-краша `0x23cf683` (BVH+QUARANTINE, diag-бинарник); (5) сцен-матчевый A/B-маршрут (фиксированная камера/boat-сцена) для specular/ASYNC/EXACT; (6) кандидаты PR #3378/#3396/#3419 и wave64-понижение (3 refused CS).
+
+## 34. Раунд 11 — тихий харнесс, настоящий 1080p с нормальным UI, скан-аут −46 MB, FidelityFX-путь и задел под DLSS (2026-11-27)
+
+Ветка **`feat-r11-1080p-ui-dlss-and-quiet`** от `feat-r10-water-heapcap-and-1440p` @ **`540d9c9`**. Коммиты: **`6287417`** (HANDOFF §1–§28 → `HANDOFF-archive.md`), **`d4c8cd8`** (AGENTS: тихий харнесс, DLSS/Streamline-правила), **`e957bf6`** (Шаг 1: `VICTORY_NATIVE_1080P` + скан-аут), **`05e7e2b`** (VICTORY_KEYS в релизе), **`340af27`** (Шаг 2: FidelityFX-путь + перехват ffx-импортов), **docs-коммит** (§34, сразу после `340af27`). `victory-shader` — **0 файлов** (`git diff --name-only 540d9c9..HEAD -- crates/victory-shader` пуст), кэш `shaders-r8-group2` не тронут.
+
+### 34.1. Шаг 0: сжатие контекста, радар, тихий харнесс
+
+- `HANDOFF.md` сокращён с 2570 до ~390 строк: §1–§28 (раунды 1–6, окружение, старые команды) перенесены в `HANDOFF-archive.md`; в основном файле шапка + §29+.
+- Радар (один read-only субагент, отчёт — `audit/round11/r11-radar.md`): апстрим `Marvisak/VIctory` (50 открытых PR), `fxceless/victory-fork` (HEAD `9a9091d180`), NVIDIA-линия. Главные факты: **(1)** «1080p-output patch» от hyphennn **не существует** — «hyphennn» это прежнее имя/сообщество форка `fxceless/victory-fork`, а его README/ветки/PR не содержат такого патча; наш рецепт (DexNom/trustno1 `9a791323ba`/`d11233aa22` при 1920×1080) — единственный проверенный. **(2)** DLSS-стек trustno1 (`63957271cd`) полностью есть в уже запинованном дереве `c437b0594b` (fidelityfx.rs 508, streamline.rs 1978, abi 679, plan 515, external.rs 51, native_1440p.rs 214 строк) — источник для следующих раундов. **(3)** В апстриме появились полезные для 8 ГБ вещи: 101Leafy #26 (RT-резерв 3072 MB и до 4 ГиБ spares не отмасштабированы под 24 ГиБ), merged #2286/#21/#2234, trustno1 `47747d6236` (дескрипторные слоты) и `826ba150c8` (фикс фиолетового мусора ambient-проб), `e31f474068` (VICTORY_SKIP_BINK), Sr-0w `bcdb9730e4` (VICTORY_KEYS в релизе — взят).
+- Тихий харнесс (`run-road.ps1`): **убраны** `HWND_TOPMOST`/`SetWindowPos(HWND_TOPMOST)`, `sendkeys2.ps1`, `AttachThreadInput`, `SetForegroundWindow`, `keybd_event`, Alt+F4 и весь расписанный ввод; окно — обычное `1280×720` в нормальном z-порядке (`HWND_NOTOPMOST`, `SWP_NOACTIVATE`), скриншоты без фокуса (`shot-<t>.png`), конец — `CloseMainWindow` → kill. `launch-game.ps1` тоже больше не делает окно topmost (фокус один раз для интерактивной игры). Путь к миру проходит через **VICTORY_KEYS** (клавиши инжектируются в HLE, `gameinput::scripted`, теперь в релизных сборках — порт Sr-0w `bcdb9730e4`).
+- Свет по умолчанию в обоих скриптах: `AMBIENT=0.6`, `AMBIENT_AIR=1.2`, `AMBIENT_SPECULAR=0.6,0.25`, `AMBIENT_SHADE=0.3,0.4`, `FPS_COUNTER=all`, `TILES_SMALL=512`. AGENTS п.9 (тихий харнесс) и п.10 (DLSS/Streamline, DLL не коммитить) добавлены; §1–§28 — в архиве.
+
+### 34.2. Шаг 1: настоящий 1920×1080 с нормальным масштабом UI + скан-аут (коммит `e957bf6`)
+
+`crates/victory-loader/src/force_1080p.rs` (+121/−12), `victory-formats` в зависимости загрузчика:
+- `VICTORY_NATIVE_1080P=1` (важнее `NATIVE_1440P`): родные 1920×1080 в **запись SDR-режима** (+0x615c100 → те же 16 байт, что у собственной 1080p-строки игры +0x615c0e0: `1920×1080@60 Гц, флаг 1`), `Settings viewport` (+0x58048d4) читает её же, `OUTPUT` (+0x224352b) = 1920×1080, обход проверки пула (+0x247af25), render scale 1.0 (+0x28f1e78). Раньше (Раунд 8) менялся только размер вывода, а UI оставался 4K — отсюда «раздутый интерфейс»; теперь UI разложен под 1080p.
+- **Скан-аут резервация** (+0x247ad4a, `mov ecx, 4000000h` = 64 MB под две 4K-плитки) пересчитывается через `victory_formats::texture::Texture` (RGBA8, `SW_64KB_D_X`, пара буферов, округление до 2 MiB): **1080p = 18 MB (экономия 46 MB)**, 1440p = 30 MB (34 MB). Проверено на байтах stock: 4K-пары = ровно 64 MB, значит формула воспроизводит оригинал.
+- Тест `the_native_1080p_fields_are_the_titles_own_1080p_mode` (сравнение с реальной 1080p-строкой игры, размеры пула, код скан-аута).
+- Гейт: `cargo check --workspace` — 0; `cargo test --workspace -- --test-threads=1` — **669 passed / 0 failed / 17 ignored** (известный warp-флейк §23.3 воспроизвёлся и при ретрае; финальный гейт с `--skip warp_budget_saturates_without_wraparound_and_preserves_draw_fields`).
+
+### 34.3. Шаг 2: DLSS-подготовка — Streamline SDK, FidelityFX-путь, перехват ffx (коммиты `05e7e2b`, `340af27`)
+
+- **SDK скачан и проверен**: `C:\GTA6_Port\scripts\get-nvidia-sdks.ps1` (порт NVIDIA-скрипта, GPL-3.0) → `C:\GTA6_Port\streamline\bin\x64`: 8 DLL (~70 MB, sl 2.14.16, nvngx 310.9.16), все с **валидной Authenticode-подписью NVIDIA Corporation** (`check-streamline.ps1`, лог `audit/round11/check-streamline.log`). В репозиторий не коммитятся; `VICTORY_STREAMLINE_DIR=C:\GTA6_Port\streamline\bin\x64` прописан в `launch-game.ps1` и `run-road.ps1`.
+- **Патч рендерера 7** — `crates/victory-loader/src/upscaler.rs` (порт `prepare_upscaler` DexNom/VIctory через trustno1): `VICTORY_UPSCALER=7` / `VICTORY_DLSS=<mode|1>` (dlaa/quality/balanced/performance/ultraperformance, `1`=quality): `RENDERER_SELECTION +0x7e9421` → 7, `UPSCALER_SIZING +0x28ef69a` → режим FFX, `NATIVE_LOAD +0x28ef6a8` / `SCALED_LOAD +0x28ef6b2` → масштаб режима, `UPSCALER_SCALE +0x615d95c` (2/3) общий — не пишется; temporal scale (render scale) = масштабу режима через `asked_render_scale`.
+- **Перехват ffx-импортов** — `crates/victory-hle/src/modules/fidelityfx.rs` (порт `Interpose` trustno1): 5 обёрток (`ffxCreateContext/DestroyContext/Configure/Query/Dispatch`) подменяют IAT-экспорты `amd_fidelityfx_loader_xbox.dll`, зовут оригинал и **читают** upscale-dispatch (`kind 0x10001`): логируются контекст (`max_render/max_output`) и первый dispatch (render/upscale/jitter/MV). **DLSS SR в этом раунде не исполняется**: обёртка возвращает dispatch заголовку (см. 34.5) — это точка подключения Streamline `slEvaluateFeature` (план `audit/dlss-prep.md`, шаги 5–6).
+- Гейт: **674 passed / 0 failed / 17 ignored** (те же `--skip`), `check` — 0.
+
+### 34.4. Шаг 3: релиз и три тихих фоновых прогона (2K-окно `1280×720`, без topmost и клавиатуры)
+
+Сборка: `cargo build --release -p victory` — 37,7 с, exe **9 325 568 Б**. Окно `1280×720` обычное; ввод — только `VICTORY_KEYS` внутри HLE; `AMBIENT=0.6/AIR=1.2/SPECULAR=0.6,0.25`; телеметрия `all`; 0 device loss / 0 ERROR во всех прогонах; захвачены скриншоты.
+
+| # | Прогон | Что включено | worldAt | world n | median | p90 | draws med | VRAM peak | итог |
+|---|--------|--------------|---------|---------|--------|-----|-----------|-----------|------|
+| 1 | `road\r11-run1` 300 с | native 1080p, render 1.0, `DLSS=0` | 67 | 237 | **159,6 мс (6,27 fps)** | 749,0 | 1 412 | **6 655 MB** | картинка нормальная, UI нормальный, все 6 сайтов + скан-аут Done |
+| 2 | `road\r11-run2` 300 с | native 1080p, FidelityFX-путь (`DLSS=quality` → 1280×720→1920×1080) | 65 | 242 | 102,8 мс | 360,0 | 1 072 | 5 980 MB | **3D-картинка чёрная**: FSR4-пайплайны не встали |
+| 3 | `road\r11-run3` 240 с | native 1080p, `RENDER_SCALE=0.6667` (рендерер 6, temporal upscale 1280×720→1080p) | 85 | 163 | **113,6 мс (8,80 fps)** | 235,5 | 1 494 | **6 079 MB** | картинка нормальная |
+
+Сравнение по равным корзинам `draws` (Run1 vs Run3, корзина 100): при 1300–1700 draws Run3 быстрее на **−1…−67 мс** (медиана дельт ≈ −21 мс), VRAM пик −576 MB (6 655 → 6 079). Сцены и маршруты разные (камеры/погода), поэтому это индикатор, а не доказанный A/B: сцену нужно матчить (следующий раунд). Run2 (чёрный кадр) по времени не сравнивать.
+
+### 34.5. Что подтвердилось и что нет
+
+**Подтвердилось (логи `out.log`/`err.log`):**
+- native 1080p: `resolution: settings' output size applied (1920x1080)`, `SDR display mode (3840x2160) (1920x1080)`, `Settings' preview viewport size load (1920x1080)`, `scanout reservation (64 MB) (1920x1080)`, `render scale (1)` — все **Done**; в run2/render scale — `0.6666667`.
+- тихий прогон доходит до мира **без единого физического нажатия**: `world (500+ draws) at 67` (run1), до этого — только `VICTORY_KEYS`-скрипт в HLE; окно не topmost и не забирает фокус.
+- DLSS-плумбинг точный: interpose привязал `ffxCreateContext`; контекст `max_render=[1280,720] max_output=[1920,1080]`; первый dispatch `render=[1280,720] upscale=[1920,1080] jitter=[0,0] motion_scale=[1,1]` — ровно размеры DLSS Quality при 1080p-выходе.
+- скипы из Раунда 10 живы: water-light `5dc3b259…` и RT-пайплайны left out; view heaps 1 000 000; `CS_RayMiss`-строки (24 в run1).
+
+**Не подтвердилось / осталось:**
+- **DLSS SR не работает**: Streamline-движка нет (наша обёртка отдаёт dispatch заголовку), а собственный FSR заголовка даёт **чёрный 3D-кадр**: `FFX FSR4 ACO: DeserializeComputePipelineStateX FAILED hr=0x80004001` + host pipeline refused `0x80070057` для wave64-compute (`wave_lanes=[64,64]`). То есть для DLSS-профиля нужен либо `slEvaluateFeature`-движок (шаги 5–6 плана: host-копии/alias/upload/depth twin + запись в host-list; в нашем дереве нет `external.rs`/`HostList` NVIDIA-дерева — ~2,2 тыс. строк адаптации), либо понижение wave64 в `victory-shader` (заморожен в этом раунде). `VICTORY_DLSS=0` — гарантированный откат.
+- **скан-аут −46 MB** подтверждён кодом/тестом, но отдельного A/B «без патча скан-аута» не делали (VRAM-разница между прогонами объясняется в основном 1080p-буферами и сценой).
+- **UI**: нормальный размер виден по субтитрам/надписям (шоты run1 shot-90/285, run3 shot-150); Settings-меню со скриншотом не поймали — проверку «интерфейс не раздут» стоит повторить на статичном меню.
+- **пересвет пляжа** (белый песок/розовое небо, run1 shot-285) и **тёмные лица** (run1 shot-150/225) остались: это не ambient-порог, а недостающий свет/тени RT (известное ограничение) — нужен отдельный раунд визуала.
+- `AMBIENT_SPECULAR=0.6,0.25` применён (24–25 info-строк, «44 dispatches of CS_RayMiss»), визуальной разницы с 1.0 по одному кадру не оценить — нужен сцен-матч.
+
+### 34.6. Артефакты
+
+- Замеры: `C:\GTA6_Port\road\r11-run{1,2,3}\` (captions/vram/err/out/shot/watch/env/version).
+- Анализ: `audit\round11\r11-analyze.ps1`, `r11-compare.ps1`, `analyze-run{1,2}.log`, `compare-runs.log`, `compare-run1-run3.log`, `run{1,2,3}-console.log`, `test-step1*.log`, `test-step2.log`, `build-release.log`.
+- Радар: `audit\round11\r11-radar.md`; SDK: `C:\GTA6_Port\scripts\get-nvidia-sdks.ps1`, `check-streamline.ps1`, `audit\round11\check-streamline.log`; Streamline: `C:\GTA6_Port\streamline\` (вне репозитория).
+- Харнесс: снапшоты `audit\round11\harness-*-r11.ps1`; `audit\dlss-prep.md` — план DLSS.
+
+### 34.7. Следующий раунд (предложение)
+
+1. **Streamline SR** (шаги 5–6 плана `audit\dlss-prep.md`): `slInit`/`slSetD3DDevice`/`slDLSSGetOptimalSettings`/`slSetConstants`/`slSetTag`/`slEvaluateFeature` в наш host-list + подготовка входов (alias/upload/depth twin) — прототип на нашем `queue.rs`/`list.rs`; тогда `VICTORY_DLSS=quality` реально исполнится. До этого — VRAM-запас: 101Leafy #26 (RT-резерв 3072 MB → по бюджету карты, spares 4 ГиБ) и upstream #3447.
+2. FSR4-пайплайны: либо wave64-понижение (потребует `victory-shader` и пере-тёплой cache — отдельный раунд), либо дождаться DLSS-движка и ходить сразу через него.
+3. Сцен-матч A/B (фиксированная камера/сцена) для native 1080p против 720p+temporal upscale и для `AMBIENT_SPECULAR`; снять Settings-меню.
+4. Визуал: пересвет пляжа/тёмные лица/фиолетовые блики (`826ba150c8` ambient probe garbage — дешёвый кандидат).
+5. Мелочи: `e31f474068` `VICTORY_SKIP_BINK` (быстрее холодные прогоны), `47747d6236` дескрипторные слоты, 101Leafy #26.

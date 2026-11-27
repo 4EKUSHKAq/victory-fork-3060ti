@@ -8447,7 +8447,20 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        #[cfg(feature = "diagnostics")]
+        let queried = std::time::Instant::now();
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        // The copy term's own bookkeeping, counted since Round 14 (Marvisak
+        // #3429, GPL-3.0-or-later): the walker was invisible in the stats and
+        // the "queries ... ms" column always showed zero.
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::Queries, 1);
+            crate::copystat::add(
+                crate::copystat::C::QueryUs,
+                queried.elapsed().as_micros() as u64,
+            );
+        }
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {

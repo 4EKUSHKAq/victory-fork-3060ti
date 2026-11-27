@@ -572,15 +572,18 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    // In place (ported from fxceless/victory-fork #1431, `9342db15f0`,
+    // GPL-3.0-or-later): the same sorted union, without a second allocation
+    // (upstream: 2.2 us -> 1.4 us for 512 ranges).
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
         }
-    }
-    out
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap

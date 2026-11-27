@@ -452,3 +452,38 @@ Series X, окно 1280×720 topmost, anti-AFK W/40 с, **все дефолты 
 3. Сцен-матч A/B (фиксированная камера/сцена) для native 1080p против 720p+temporal upscale и для `AMBIENT_SPECULAR`; снять Settings-меню.
 4. Визуал: пересвет пляжа/тёмные лица/фиолетовые блики (`826ba150c8` ambient probe garbage — дешёвый кандидат).
 5. Мелочи: `e31f474068` `VICTORY_SKIP_BINK` (быстрее холодные прогоны), `47747d6236` дескрипторные слоты, 101Leafy #26.
+
+## 35. Раунд 12 (в работе) — диагностика кадра, масштаб UI, фиолетовый мусор проб, план lit-фолбэка теней
+
+Ветка **`feat-r12-visual-light-fixes`** от `feat-r11-1080p-ui-dlss-and-quiet` @ **`6d12af6`**. Коммиты: **`ff09430`** (Шаг A: диагностика в `capture.rs`), **`b77a41e`** (B1: фиолетовый мусор проб), этот docs-коммит. `victory-shader` не тронут.
+
+### 35.1. Что изучено (внешний документ)
+
+Пользователь прислал `C:\Users\4EKUSHKA\Downloads\plan-rendering-parallel-discord.md` — это план проекта **`ubiquitarianism/leonida`** (C++/Vulkan-слой для GTA VI на Linux/RADV, тот же образ 1.0.2.1), не VIctory: прямых патчей нет, опыт AMD-only. Полезное: диагностика экспозиции через 1×1 luminance (у нас `capture.rs` уже логирует, но **не считал non-finite**), «чёрные лица» могут быть из-за недогруженных входов decoration bake, а не только RT; **тени — это `R32_UINT` shadow-mask таблица** (в нашем `capture.rs:697-720` уже описан её формат: 0 = полностью в тени, 1..255 = значение блока, >255 = atlas-блок, `0xFFFFFFFF` = никогда не записан), а не R9G9B9E5 light image; RT на их числах требует 24 ГБ и у нас заблокирован. Их «slot-133 shadows» — не маски теней (проверено по их docs).
+
+### 35.2. Шаг A — диагностика без изменения поведения (`ff09430`)
+
+- `crates/victory-gpu/src/capture.rs`: в лог `target values` добавлен `not_finite` (NaN/Inf в целях кадра, включая 1×1 exposure/luminance — раньше фильтровался из low/high), в `target texel` — счётчик non-finite каналов; в дампе `R32_UINT`-таблиц — доли `zero_percent` и `all_ones_percent` (доля «полностью в тени» и «никогда не записан»).
+- `audit/round12/r12-analyze.ps1`: региональные метрики по скриншотам (mean/median luma, dark-share по прямоугольникам лицо/вода/пляж/небо, fpsbox исключён; регионы задаются долями кадра `-Regions`), плюс captions (world median/p90) и VRAM peak.
+- Гейт: `cargo check --workspace` 0; `cargo test --workspace -- --test-threads=1 --skip warp_budget_…` — 0 failed (известный флейк §23.3 пропущен).
+
+### 35.3. B0 — масштаб интерфейса: измерено и решено
+
+Причина «огромного» UI: интерфейс раскладывается в **абсолютных пикселях вывода**, а не в долях кадра. Замер по меню (одно окно `1280×720`, скриншоты `road\r12-ui1080\shot-30.png` и `road\r12-ui1440\shot-30.png`):
+- `VICTORY_NATIVE_1080P=1` (вывод 1920×1080): «ВЫБОР УЧЁТНОЙ ЗАПИСИ» ≈ **355×38 px**, глифы Y/A ≈ 30 px;
+- `VICTORY_NATIVE_1440P=1` + `VICTORY_RENDER_SCALE=0.5` (вывод 2560×1440, сцена 1280×720): та же надпись ≈ **246×30 px**, т.е. **на ~30 % меньше** — нормальный масштаб 2K-интерфейса при рендер-косте ~720p.
+Решение (закреплено в `run-road.ps1` и `launch-game.ps1`): **по умолчанию `Native1440p=1` + новая ручка `-RenderScale 0.5`** (`VICTORY_RENDER_SCALE=0.5`); `Native1080p` остаётся опцией. Отдельного «HUD/Scaleform-сайта» под 1080p не нашли: судя по абсолютным пикселям, его и нет — вернуть 1080p с нормальным UI можно лишь патчем UI-scale, а не размера дисплея (кандидат для следующего раунда, если он нужен). Прочее из профиля Раунда 11 сохранено: `VICTORY_DLSS=0`, `VICTORY_FPS_COUNTER=all`, `TILES_SMALL=512`, тихий харнесс без topmost/физического ввода (`VICTORY_KEYS`).
+
+### 35.4. B1 — фиолетовый мусор ambient-проб (`b77a41e`)
+
+Порт trustno1-coder/VIctory-NVIDIA `826ba150c8` (GPL-3.0-or-later): 9 строк HLSL в наш `ambient.rs::raise` — перед подъёмом света сбрасываются magenta/violet остатки в light image (зелёный < 0.5×min(красный, синий) и > 0.02; и синий > 2.5×зелёного при синем > красного). Возможен второй источник фиолетового — наш reflection-стенд-ин (проверяется в B4 A/B `SPECULAR=0/0.2/0.6`). Гейт: check 0, test 0 failed.
+
+### 35.5. Что осталось (следующий сеанс)
+
+- **B2:** lit-фолбэк `R32_UINT` shadow-mask таблицы. Уже есть инструменты: `capture.rs` пишет классы и доли. Нужен диагностический кадр с **diag-бинарём** (`VICTORY_CAPTURE`, feature `diagnostics`) — у него отдельный ключ кэша шейдеров, потребуется прогрев; затем найти ресурс маски (по формату 42 и классам: много `0`/`0xFFFFFFFF` при выключенном RT) и ставить мягкий lit-уровень (255) для незаписанных/полностью теневых блоков, opt-in флагом (`VICTORY_RT_SHADOW=lit`) и дефолтом после A/B.
+- **B3:** по дампу проверить decoration bake (недогруженные входы при чёрных лицах) — `VICTORY_BAKE_SOURCES=1` уже включён, но нужен upload-ahead, если дамп это покажет; плюс запас 8 ГБ (101Leafy #26, `BAKE_TEXTURES_MS=25`).
+- **B4:** тихий сцен-матч A/B (`RENDER_SCALE=0.5`, свет 0.4–0.6, `SPECULAR=0/0.2/0.6`, `SPECULAR_ALPHA=1`) с региональными метриками `r12-analyze.ps1`, закрепление лучших значений, затем §35-итог и push.
+
+### 35.6. Артефакты
+
+`audit\round12\`: `check-stepA.log`, `test-stepA.log`, `check-b1.log`, `test-b1.log`, `build-release.log`, `r12-analyze.ps1`, `harness-*-r12.ps1`, `ui1080-console.log`, `ui1440-console.log`. Скриншоты сравнения UI: `C:\GTA6_Port\road\r12-ui1080\`, `C:\GTA6_Port\road\r12-ui1440\`. Документ-источник разбора: `C:\Users\4EKUSHKA\Downloads\plan-rendering-parallel-discord.md`.

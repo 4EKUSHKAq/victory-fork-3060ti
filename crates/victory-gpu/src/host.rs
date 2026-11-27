@@ -6184,8 +6184,11 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. With
+        // VICTORY_HEAP_SYNC_ASIDE a thread of its own mirrors them while the
+        // rest of the preparing goes on; the wait for it is the guard's drop,
+        // just before the lists are sent.
+        let heaps_synced = crate::descriptor::begin_sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6290,6 +6293,8 @@ impl Host {
         }
         let has_tiles: Vec<bool> = runs.iter().map(|l| l.has_tile_steps()).collect();
         let segments = tile_segments(&has_tiles, &firsts, lists.len());
+        // The heaps' records are mirrored before any list goes to the queue.
+        drop(heaps_synced);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;

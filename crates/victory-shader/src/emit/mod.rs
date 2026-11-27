@@ -356,6 +356,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     // refused and this shader keeps the lowering it had.
     if lower::host_max_wave() == 32 && c.digest == water_tile_append::CONTAINER_ID {
         water_tile_append::rewrite(&mut native)?;
+        // Whether the patch found its program: `translate --cache` with
+        // `VICTORY_DEBUG_WATER_TILE=1` says so once (the offline translator
+        // has no log of its own; nothing is printed without the switch).
+        if std::env::var_os("VICTORY_DEBUG_WATER_TILE").is_some() {
+            eprintln!("water tile append: the transmission tile program is lowered for 32-lane waves");
+        }
     }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its

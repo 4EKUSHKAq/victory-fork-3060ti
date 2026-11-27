@@ -91,6 +91,11 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    // The console's protection as asked: 0x400 says write-combined, memory the
+    // title's CPU writes and does not read. The host flags below drop it (our
+    // GPU side reads this memory through the CPU), but the GPU side remembers
+    // the region (`VICTORY_WC_NO_BACK` uses it).
+    let asked = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -166,6 +171,13 @@ pub extern "system" fn XMemVirtualAlloc(
     // are uncommitted go (`VICTORY_ABSENT_ONCE`).
     if !at.is_null() && kind & MEM_COMMIT != 0 {
         victory_gpu::title_memory_committed(at as usize, size);
+    }
+    // Write-combined: memory the title's CPU writes and does not read
+    // (port of trustno1-coder/VIctory-NVIDIA, `xmem.rs` and `shadow.rs`,
+    // GPL-3.0-or-later; `VICTORY_WC_NO_BACK` keeps what shaders write there on
+    // the card).
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
     }
     at
 }

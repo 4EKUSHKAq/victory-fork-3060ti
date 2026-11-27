@@ -1795,6 +1795,8 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     if reservation::enabled() { ask_once_end(); }
+    // Write-combined regions there are gone with the mapping.
+    crate::shadow::write_combined_freed(at, len);
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);

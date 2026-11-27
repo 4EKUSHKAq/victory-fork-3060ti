@@ -79,6 +79,7 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

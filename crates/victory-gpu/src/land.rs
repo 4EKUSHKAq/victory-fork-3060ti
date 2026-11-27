@@ -1,6 +1,7 @@
 //! What shaders wrote goes into title memory on a few threads
-//! (`VICTORY_LAND`, on by default; `=0` merges piece by piece on the thread
-//! that lands flights, as before).
+//! (`VICTORY_LAND=1`, **off by default in this tree**: see [`on`] and
+//! HANDOFF 42; unset or `0` merges piece by piece on the thread that lands
+//! flights, as before).
 //!
 //! The relay's thread (`crate::host::relay`) was 58-60 ms of a 104 ms frame
 //! landing (run record-1): some 1,500 pieces of 64 KiB, 98 MB, fetched from
@@ -43,11 +44,23 @@ const PAGE: usize = 4096;
 /// About this many bytes to a job.
 const JOB: usize = 256 << 10;
 
-/// See the file.
+/// See the file. `VICTORY_LAND=1` opts in; **off by default in this tree**:
+/// Round 19 measured the port as it stands (r19-run1 against r19-runA, the
+/// same binary and the same scene) and the landing itself got faster (the
+/// frame line's "copying back" 67.4 -> 47.0 ms) while the submitting
+/// thread's "copies" rose 33.8 -> 51.9 ms and "preparing" 84.2 -> 107.2 ms:
+/// the frame got slower (105.5 -> 117.4 ms, 9.50 -> 8.50 fps). A piece put
+/// in by `safecopy` writes title memory directly, without the landed-beside
+/// notes and the copies' taken pages that this tree's `put_back_quiet` and
+/// `put_back_own` keep (the tree it came from has `watch::landed_beside`,
+/// its `LANDED` bits and `Shadow::landed`; they are the part not ported, see
+/// the file's note), so the next refreshes take the landed blocks again.
+/// Use it for its own A/B (`VICTORY_LAND=1 VICTORY_LAND_THREADS=<n>`), not
+/// in the locked profile, until those notes are ported.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_LAND").is_none_or(|v| v != "0")
+        std::env::var_os("VICTORY_LAND").is_some_and(|v| v == "1")
             && crate::safecopy::on()
             && crate::shadow::exact_back()
     })

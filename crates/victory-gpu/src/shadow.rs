@@ -28,6 +28,20 @@
 //! the compare sits where a refresh copies stale pages (this tree has no
 //! `take`/`runs` to put it in), and the write-watch reset of the landing
 //! takes the place of `watch::block_published`.
+//!
+//! Port of fxceless/victory-fork PR #1437 (GPL-3.0-or-later), read at
+//! `fb09e374b9b54cd093d93bd64e900821dcb1b52e`: the thread-local page buffer
+//! and one `copied` lock per busy span of [`Shadow::merge_under_writes`];
+//! adapted to this tree: its merge has no masked-patch branch, and the runs
+//! compared are this tree's exact byte runs.
+//!
+//! Port of trustno1-coder/VIctory-NVIDIA PR #145 (GPL-3.0-or-later), read at
+//! `260e4461621ad67f07bd8ea05b67880fbc8e4700`: the AVX2 compare for the
+//! runs a refresh and a copy-back compare ([`changed_runs_avx2`]); adapted
+//! to this tree: there is no `dword_runs` here (the runs are exact bytes),
+//! so the AVX2 form is the wide [`changed_runs`]'s, which the copy-back
+//! merge uses; the refresh's compare is whole-chunk `changed_chunks` beside
+//! it and needs none.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -2319,6 +2333,103 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// than the walk in the last two, by a fifth: it never ran in a game.)
 #[cfg(target_arch = "x86_64")]
 fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    // The AVX2 compare when the processor has it (port of trustno1-coder/
+    // VIctory-NVIDIA PR #145: the same runs, found with wider compares).
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_sse2(now, was)
+}
+
+/// [`changed_runs_wide`] 32 bytes at a time with AVX2: the compare
+/// trustno1-coder/VIctory-NVIDIA PR #145 widens `word_runs` with, here over
+/// exact bytes. Bit `k` of each 64-byte mask: byte `base + k` differs; the
+/// runs are read off the masks as in [`changed_runs_sse2`].
+///
+/// # Safety
+/// The processor has AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        // Bit `k`: byte `base + k` differs.
+        let mut differ = 0u64;
+        for part in 0..2 {
+            let at = base + 32 * part;
+            // SAFETY: `at + 32 <= base + 64 <= n`, the length of both
+            // slices; the loads are unaligned ones.
+            let equal = unsafe {
+                let a = _mm256_loadu_si256(now.as_ptr().add(at).cast::<__m256i>());
+                let b = _mm256_loadu_si256(was.as_ptr().add(at).cast::<__m256i>());
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32
+            };
+            differ |= u64::from(!equal) << (32 * part);
+        }
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
+                }
+            }
+        }
+        base += 64;
+    }
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+/// [`changed_runs`] 64 bytes at a time: one mask of the bytes that differ
+/// (four 16-byte compares), and the runs read off the masks. Every byte is
+/// read once. Timed on 48 MB against the walk (2026-11-25, this PC): all
+/// equal 4.3 against 4.3 ms; all differing 4 against 12; one byte in 64
+/// differing 14 against 21; 12 of every 16 differing 24 against 34. (A form
+/// that compared 64 equal bytes and then walked eight at a time was slower
+/// than the walk in the last two, by a fifth: it never ran in a game.)
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_sse2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let n = now.len().min(was.len());
     let (now, was) = (&now[..n], &was[..n]);
@@ -2601,6 +2712,117 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The AVX2 compare gives the same runs as the byte walk, over random
+    /// rounds and the edges of its 64-byte steps: the port of trustno1-
+    /// coder/VIctory-NVIDIA PR #145's `word_runs_are_the_dword_runs` for
+    /// this tree's exact-byte runs.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_changed_runs_are_the_byte_runs() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for round in 0..200 {
+            let n = 4 * (random() as usize % 400);
+            let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..random() % 200 {
+                if n == 0 {
+                    break;
+                }
+                let at = random() as usize % n;
+                let len = (random() as usize % 24).min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b = random() as u8;
+                }
+            }
+            // SAFETY: the processor has AVX2 (checked).
+            let wide = unsafe { super::changed_runs_avx2(&now, &was) };
+            assert_eq!(wide, changed_runs_bytes(&now, &was), "round {round}");
+            let mut put = was.clone();
+            for &(at, n) in &wide {
+                assert!(n > 0);
+                put[at..at + n].copy_from_slice(&now[at..at + n]);
+            }
+            assert_eq!(put, now, "round {round}");
+        }
+        // The edges of the 64-byte steps and the tail.
+        for n in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 1000] {
+            let was: Vec<u8> = (0..n as u32).map(|i| (i * 13 + 5) as u8).collect();
+            for change in [0usize, n / 2, n.saturating_sub(1)] {
+                let mut now = was.clone();
+                if n > 0 {
+                    now[change] ^= 0x41;
+                }
+                // SAFETY: as above.
+                assert_eq!(
+                    unsafe { super::changed_runs_avx2(&now, &was) },
+                    changed_runs_bytes(&now, &was),
+                    "{n} bytes, changed at {change}"
+                );
+            }
+        }
+    }
+
+    /// The merge's page puts only the title's changed bytes into the copy's
+    /// reference and leaves what shaders wrote beside them: the result the
+    /// walk gave before the shared page buffer and the one lock per busy
+    /// span (fxceless/victory-fork#1437). The shader-written range is the
+    /// bytes that differ from the title only in the copy's other side, which
+    /// this reference does not hold.
+    #[test]
+    fn a_merge_page_puts_only_the_title_changes() {
+        let before: Vec<u8> = (0..super::PAGE).map(|i| (i * 31 + 7) as u8).collect();
+        let mut title = before.clone();
+        // The title's CPU wrote three ranges since the snapshot was taken.
+        for (at, len) in [(10usize, 5usize), (1000, 1), (super::PAGE - 3, 3)] {
+            for b in &mut title[at..at + len] {
+                *b = !*b;
+            }
+        }
+        let mut held = before.clone();
+        let (runs, bytes) = super::Shadow::merge_into_page(&title, &mut held);
+        // What the old walk (byte by byte) made of it: the differing bytes in
+        // runs that do not touch.
+        let mut reference = before.clone();
+        let mut expected: Vec<(usize, usize)> = Vec::new();
+        for (at, &now) in title.iter().enumerate() {
+            if now != before[at] {
+                reference[at] = now;
+                match expected.last_mut() {
+                    Some(last) if last.0 + last.1 == at => last.1 += 1,
+                    _ => expected.push((at, 1)),
+                }
+            }
+        }
+        assert_eq!(runs, expected);
+        assert_eq!(held, reference);
+        assert_eq!(bytes, expected.iter().map(|r| r.1).sum::<usize>());
+        // A page where the title wrote nothing since the snapshot: no run is
+        // made, so a copy whose shaders wrote there keeps their bytes (the
+        // merge writes only the runs into the copy's mapping).
+        let mut snapshot = before.clone();
+        let (runs, bytes) = super::Shadow::merge_into_page(&before, &mut snapshot);
+        assert!(runs.is_empty() && bytes == 0 && snapshot == before, "nothing of the title's to put");
+        let mut mapping: Vec<u8> = before.iter().map(|&b| b ^ 0x5a).collect();
+        for &(at, n) in &expected {
+            mapping[at..at + n].copy_from_slice(&title[at..at + n]);
+        }
+        for i in 0..super::PAGE {
+            let title_changed = title[i] != before[i];
+            assert_eq!(
+                mapping[i],
+                if title_changed { title[i] } else { before[i] ^ 0x5a },
+                "byte {i}"
+            );
+        }
     }
 }
 
@@ -3843,90 +4065,133 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
-            // As the refresh itself asks (`update_free`): the journal if
-            // the submission's asking covered the range, else the kernel,
-            // else the guards. The journal alone said nothing for copies
-            // of view memory, which is guarded and not write-watched, and
-            // those were all of run 99's cases: the flights were settled
-            // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
-            };
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
+        // One page buffer for the thread, not one made (and zeroed) at every
+        // call (fxceless/victory-fork#1437).
+        thread_local! {
+            static MERGE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        MERGE_BUF.with(|cell| {
+            let mut title_buf = cell.borrow_mut();
+            let mut taken_pages: Vec<usize> = Vec::new();
+            for (a, e) in busy {
+                // As the refresh itself asks (`update_free`): the journal if
+                // the submission's asking covered the range, else the kernel,
+                // else the guards. The journal alone said nothing for copies
+                // of view memory, which is guarded and not write-watched, and
+                // those were all of run 99's cases: the flights were settled
+                // 4-5 times a frame for "0 pages looked at".
+                let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                    return true;
+                };
+                let stale: Vec<usize> = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    stale_pages_in(base, &copied, a, e, &written)
+                };
+                if stale.is_empty() {
                     continue;
                 }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
+                // (The first busy span that has a page to compare takes the
+                // buffer in.)
+                if title_buf.len() < PAGE {
+                    title_buf.resize(PAGE, 0);
                 }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        return true;
+                taken_pages.clear();
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo >= hi {
+                        continue;
                     }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    let n = hi - lo;
+                    let title = &mut title_buf[..n];
+                    // The lock of the copy's reference (the snapshot, or the
+                    // CPU's side of a copy in the card's memory), from before
+                    // title memory is read until the title's bytes are in: with
+                    // the copy-back on its own thread ([`relay`]) that thread
+                    // puts what the card wrote into title memory and into the
+                    // reference under the same lock, and a page read before
+                    // such a merge and compared after it would take the card's
+                    // bytes for the title's.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked at
+                    // again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
                     }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
+                    if self.card.is_some() {
+                        // SAFETY: inside the mapping of the copy's CPU side,
+                        // which only the submitting thread writes.
+                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let runs = joined_over(changed_runs(title, held), merge_gap());
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                    } else {
+                        let Some(snapshot) = before.as_mut() else {
+                            return true;
+                        };
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                        let (runs, _) = Self::merge_into_page(title, held);
+                        for (r, m) in runs {
+                            // SAFETY: inside the copy's mapping. The card may be
+                            // writing the copy beside these bytes; they are
+                            // written here and nothing around them.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m)
+                            };
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                    }
+                    drop(before);
+                    // Taken, if the range holds all of the page that is in the
+                    // copy; else the rest of it is the refresh's, which notes
+                    // only whole pages, and the page is looked at again.
+                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                        taken_pages.push(page);
                     }
                 }
-                drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                // One lock of the copy's notes per busy span, not one per
+                // page (fxceless/victory-fork#1437).
+                if !taken_pages.is_empty() {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                    for page in &taken_pages {
+                        if let Some(at) = copied.get_mut(page - base) {
+                            *at = now;
+                        }
                     }
                 }
             }
+            false
+        })
+    }
+
+    /// Puts the bytes of `title` that differ from `held` into `held` (a
+    /// copy's reference: its CPU side or its snapshot, as
+    /// [`Shadow::merge_under_writes`] finds it), and gives their runs and
+    /// bytes. What shaders wrote beside them is left as it is: only the
+    /// title's changed bytes go back, as the walk did before the shared page
+    /// buffer (fxceless/victory-fork#1437). The runs are [`changed_runs`]':
+    /// every differing byte is in one and no equal byte is.
+    fn merge_into_page(title: &[u8], held: &mut [u8]) -> (Vec<(usize, usize)>, usize) {
+        let runs = changed_runs(title, held);
+        let mut bytes = 0;
+        for &(r, m) in &runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            bytes += m;
         }
-        false
+        (runs, bytes)
     }
 
     /// At submission: copies what changed of `[address, address + len)`

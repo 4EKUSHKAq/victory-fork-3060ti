@@ -4,6 +4,21 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
+//!
+//! Port of fxceless/victory-fork PR #812's frame line, "Watch: unmapped view
+//! blocks are parked, not asked about at every check" (GPL-3.0-or-later),
+//! read at `e277b98e6063f9c0ad02f61a7356f783803a73ba`: the view-memory
+//! askings line of [`Meter`]; adapted to this tree's counts
+//! (`crate::watch::view_stats`, `crate::watch::parked_blocks`).
+//!
+//! Port of fxceless/victory-fork PR #1437, "GPU: avoid per-call allocs/locks
+//! in merge_under_writes and redundant refresh scans" (GPL-3.0-or-later),
+//! read at `fb09e374b9b54cd093d93bd64e900821dcb1b52e`:
+//! [`stale_under_flights_spans`] and the one `Step::Refresh` walk that feeds
+//! both the `VICTORY_ASK_ONCE` ranges and those spans; adapted to this
+//! tree: its `step_index` walk stays for the submission without
+//! `VICTORY_ASK_ONCE`, and its `Batch` has no `title_wrote_near` to make
+//! cheaper (`title_written` flushes every pending refresh already).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -3682,6 +3697,20 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    stale_under_flights_spans(&spans)
+}
+
+/// [`stale_under_flights`]'s answer for spans already built: per copy, the
+/// span of what the submission refreshes. Port of fxceless/victory-fork
+/// PR #1437 (GPL-3.0-or-later), read at
+/// `fb09e374b9b54cd093d93bd64e900821dcb1b52e`; adapted to this tree: the
+/// submission with `VICTORY_ASK_ONCE` gathers the spans in the same walk as
+/// the asking's ranges, so the second pass over every `Step::Refresh` is
+/// gone.
+fn stale_under_flights_spans(spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -6338,27 +6367,67 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        // The same walk gathers the spans `stale_under_flights` would settle
+        // the flights on, so the steps are passed over once (fxceless/
+        // victory-fork#1437, the second pass is gone).
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            use std::sync::Arc;
+            let mut watched: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut pending: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            let mut pending_at: std::collections::HashMap<usize, Option<usize>> = std::collections::HashMap::new();
+            let mut last_watched: (usize, usize, usize) = (0, usize::MAX, 0);
+            let mut last_pending: (usize, Option<usize>) = (0, None);
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let key = Arc::as_ptr(shadow) as usize;
+                        if !shadow.unwatched() {
+                            // Steps of one copy mostly follow one another: the
+                            // last answer is tried first, as in
+                            // [`stale_under_flights`].
+                            if last_watched.0 == key {
+                                last_watched.1 = last_watched.1.min(*address);
+                                last_watched.2 = last_watched.2.max(*address + *len);
+                            } else {
+                                if last_watched.0 != 0 {
+                                    let entry = watched.entry(last_watched.0).or_insert((usize::MAX, 0));
+                                    *entry = (entry.0.min(last_watched.1), entry.1.max(last_watched.2));
+                                }
+                                last_watched = (key, *address, *address + *len);
+                            }
+                        }
+                        if behind {
+                            let at = if last_pending.0 == key {
+                                last_pending.1
+                            } else {
+                                let at = *pending_at.entry(key).or_insert_with(|| {
+                                    shadow.writes_pending().then(|| {
+                                        pending.push((shadow.clone(), usize::MAX, 0));
+                                        pending.len() - 1
+                                    })
+                                });
+                                last_pending = (key, at);
+                                at
+                            };
+                            if let Some(at) = at {
+                                let s = &mut pending[at];
+                                (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                            }
+                        }
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            if last_watched.0 != 0 {
+                let entry = watched.entry(last_watched.0).or_insert((usize::MAX, 0));
+                *entry = (entry.0.min(last_watched.1), entry.1.max(last_watched.2));
+            }
+            let ranges: Vec<(usize, usize)> = watched.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights_spans(&pending) {
                 let settling = std::time::Instant::now();
                 self.wait_stale(runs, &mut submitted);
                 settled += settling.elapsed();
@@ -9040,6 +9109,21 @@ impl Meter {
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
+        // The view-memory askings (fxceless/victory-fork#812): how many were
+        // answered from the set of not-clean view blocks in one lookup, how
+        // many walked, the parked blocks and the questions to Windows.
+        {
+            let [fast, walked_askings, walked, asked, absent_asked, unparked] =
+                crate::watch::view_stats().map(|n| n as f64 / frames);
+            let (parked, ordinary) = crate::watch::parked_blocks();
+            tracing::info!(
+                "view memory askings per frame (VICTORY_VIEW_SET): {fast:.0} answered in one lookup, \
+                 {walked_askings:.0} walked {walked:.0} blocks that were not clean; {parked} blocks parked as \
+                 uncommitted ({ordinary} of them no placeholder, looked at again), {absent_asked:.0} questions to \
+                 Windows whether they still are, {unparked:.1} found committed; {asked:.1} questions to Windows \
+                 whether a range is a view"
+            );
+        }
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();

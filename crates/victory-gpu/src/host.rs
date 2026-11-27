@@ -8646,8 +8646,10 @@ impl Host {
         let charge = size.checked_next_multiple_of(64 << 10)?;
         // One creator at a time spends the headroom; releases only subtract.
         let _allocating = READONLY_UPLOAD_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
-        let [budget, used, ..] = self.video_memory()?;
-        let kept = crate::shadow::card_room_kept().saturating_add(crate::resource::targets_room_kept());
+        let memory = self.video_memory()?;
+        let [budget, used, ..] = memory;
+        let kept = crate::shadow::card_room_kept()
+            .saturating_add(crate::resource::targets_room_kept(Some(memory)));
         if !readonly_upload_fits(charge, READONLY_UPLOAD_BYTES.load(Ordering::Relaxed), limit, budget, used, kept) {
             return None;
         }
@@ -9543,8 +9545,10 @@ impl Host {
         // As for a card copy: one creator at a time spends the headroom;
         // releases only subtract from the count and never take this lock.
         let _allocating = REBAR_COPY_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
-        let [budget, used, ..] = self.video_memory()?;
-        let kept = crate::shadow::card_room_kept().saturating_add(crate::resource::targets_room_kept());
+        let memory = self.video_memory()?;
+        let [budget, used, ..] = memory;
+        let kept = crate::shadow::card_room_kept()
+            .saturating_add(crate::resource::targets_room_kept(Some(memory)));
         if !rebar_copy_fits(charge, REBAR_COPY_BYTES.load(Ordering::Relaxed), limit, budget, used, kept) {
             return None;
         }

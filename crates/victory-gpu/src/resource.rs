@@ -1534,8 +1534,9 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+        Some(memory @ [budget, used, ..]) => {
+            used + crate::shadow::card_room_kept() + targets_room_kept(Some(memory))
+                < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1559,20 +1560,39 @@ pub(crate) fn room() -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(memory: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let most = targets_room_most(memory.map(|[budget, ..]| budget), asked);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
 }
 
+/// The reserve [`targets_room_kept`] keeps: the switch's megabytes when it
+/// names any, else 3 GiB capped at **a quarter of the card's budget**
+/// (port of 101Leafy/victory-leafy PR #26, "the card memory this port keeps
+/// follows the card's budget", GPL-3.0-or-later).
+///
+/// A reserve is a share of a card, not a number of gigabytes. The figured
+/// 3 GiB was measured on a 24 GiB card, an eighth; on an 8 GiB RTX 3060 Ti
+/// the same 3 GiB is more than a third, held out of the texture queue's
+/// reach for targets that may never need it - the queue then stops uploading
+/// while the title's textures have nowhere to go (Round 12: "no room on the
+/// card", refused uploads re-asked every frame). A quarter of the budget is
+/// 3 GiB at 12 GiB and up, so nothing measured there moves.
+#[cfg(windows)]
+fn targets_room_most(budget: Option<u64>, asked: Option<u64>) -> u64 {
+    if let Some(mb) = asked {
+        return mb.min(8192) << 20;
+    }
+    (3072 << 20).min(budget.map_or(u64::MAX, |budget| budget / 4))
+}
 /// [`room`] as it was at most a tenth of a second ago, for a question
 /// asked of many textures a frame ([`room`] asks the system each time).
 #[cfg(windows)]
@@ -4318,6 +4338,22 @@ float4 lit() : SV_Target { return 1.0; }
         );
         assert_eq!(super::default_texture_room_percent(None), 90);
         assert_eq!(super::default_texture_room_percent(Some(0)), 90);
+    }
+
+    /// The reserve for render targets is a share of the card, not a fixed 3
+    /// GiB (101Leafy/victory-leafy PR #26): an 8 GiB card keeps a quarter,
+    /// 12 GiB and up keep 3 GiB, and the switch still overrides it.
+    #[test]
+    #[cfg(windows)]
+    fn the_targets_reserve_follows_the_card_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::targets_room_most(None, None), 3072 << 20);
+        assert_eq!(super::targets_room_most(Some(24 * GIB), None), 3072 << 20);
+        assert_eq!(super::targets_room_most(Some(12 * GIB), None), 3072 << 20);
+        assert_eq!(super::targets_room_most(Some(8 * GIB), None), 2 * GIB);
+        assert_eq!(super::targets_room_most(Some(4 * GIB), None), 1 * GIB);
+        assert_eq!(super::targets_room_most(Some(8 * GIB), Some(500)), 500 << 20);
+        assert_eq!(super::targets_room_most(Some(8 * GIB), Some(16_384)), 8192 << 20);
     }
 
     /// The source a placed view aliases is held while the caller copies it:

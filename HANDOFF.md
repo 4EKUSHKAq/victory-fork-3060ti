@@ -1132,3 +1132,77 @@ AGENTS п.8 дополнен: в начале КАЖДОГО раунда обя
 
 - `audit\round20\`: `nvidia-delta.md` (274 строки), `landed-beside-map.md` (592), `port-landed-notes.md` (213), `port-812-notes.md`, диффы `pr812/pr1437/pr145/pr81/pr125/pr127/pr139.diff`, `prebuild-r20.ps1` + `prebuild\` (лог 33 мин, `snapshots.log`), снимки `harness-run-road-r20.ps1`/`launch-game-r20.ps1`/`run-r20.ps1`, `r20-frames.ps1`/`r20-compare.ps1`, `commit-msg-*.txt`, `handoff-43-draft.md`, `artifacts\` — включая **улики артефактов**: `user_artifact1..3.png`, `prebuild_artifacts_540/555.png` против `libtest_clean_165/180.png` и `r19_clean_540.png`.
 - Прогоны: `road\r20-run0` (контроль, с артефактами), `road\r20-run1b` (основной, с артефактами), `road\r20-run2` (качество, с артефактами), `road\r20-run1` (холодный до prebuild, невалиден по сцене), `road\r20-libtest` (холодный после удаления библиотеки — чистый), `road\r20-runW` (runtime-библиотека — чистый, но медленный: библиотека ещё не набрана).
+
+---
+
+## 44. Раунд 21 — перевод порта на чистую базу `trustno1-coder/VIctory-NVIDIA`: ветка `nvidia-3060ti` (28.11.2026)
+
+Решение пользователя: не чинить 43 слоя заплаток старой базы, а перевести порт на свежую `trustno1-coder/VIctory-NVIDIA`, которая в Раунде 16 на этой же карте показала 11.95-13.28 fps и 0 фризов >150 мс, и имеет F1-меню, F3-панель и полноценный DLSS SR. Старая ветка `main-3060ti` (`92783a6`) не удаляется и не переписывается — она остаётся в `myfork` полным архивом.
+
+Ветка `nvidia-3060ti` создана в `C:\GTA6_Port\victory-fork` от `nvidia/main` = **`df2daaf`** (свежий `git fetch nvidia`). Перенесены `AGENTS.md`, `HANDOFF.md`, `HANDOFF-archive.md`, `.cargo/config.toml` (`target-cpu=x86-64-v3`, alias `xtask`). Коммиты ветки: `395f672` (ветка + перенос), `4920d55` (правила AGENTS 11-14), `a854db3` (8-ГБ тюнинг), `08a9c4f` (его откат по замеру), этот §44. Всё запушено в `myfork nvidia-3060ti`. Драйвер весь раунд — **NVIDIA 621.40** (обновился 28.11 в 00:00:32, §43.0); `victory-shader` не тронут, старые кэши целы.
+
+### 44.1. Радар (AGENTS п.8; `audit\round21\radar.md`, `radar2.md`)
+
+- **`trustno1-coder/VIctory-NVIDIA`:** `0cef07e → df2daaf` (13 коммитов/merge). Существенное: PR #88 «no arena storm when the low range is full; reserve the arenas' room at the start», PR #77 «audio DSP mono convolutions (phone calls, TVs, reverb)», PR #58 «placed views ignore padding words» (утечка views/конфетти на лицах), плюс вся серия запуска/D3D12: `0f0ada1`, `f3534e6`, `e69e39c`, `df2daaf` (Agility-версия, Windows 10 runtime, VICTORY_HOME, «ask for logs»). Ни одного изменения воды в этом окне — серия #45 закрыта (независимо подтверждает §43.2).
+- **100 открытых PR их дерева.** Для нашего 8-ГБ профиля в план Раунда 22 отобраны: **#196** «A lighter profile for 8 GB cards and 16 GB of RAM», **#168** «texture catch-up, 64 ms passes and no room held for targets» (их замер: 4x меньше кадров >150 мс), **#293** (окна/отправки в карту на малом общем бюджете), **#399** (гейт новых текстурных блоков и by-address VRAM о бюджет), **#423** (пропуск 1.5-с полного прохода текстур перед bake), **#448/#444** (упаковка heap-ranges, bitset вместо Vec<bool>), **#342** (правки play-foxhound по замерам), **#216** (тёплый старт без рестарта). Остальные 12 репозиториев — только заголовки свежих PR (20 % внимания), полный список в `radar2.md`.
+
+### 44.2. Шаг 1: наш 8-ГБ тюнинг добавлен, измерен и ОТКАЧЕН (`a854db3` → `08a9c4f`)
+
+По заданию в `crates/victory-gpu/src/resource.rs` добавлены `targets_room_most` (резерв render-target'ов ≤ `budget/4`) и `default_texture_room_percent` (94 % на картах ≤8 ГиБ). Заодно исправлен юнит старого порта: он проверял `8 TiB` вместо `8 GiB`, т.е. «малой» считалась любая карта. Замер в равных корзинах `draws` на лодочной миссии (DLSS=0, 1080p, драйвер 621.40):
+
+| прогон (окно, draws 3900-4100) | fps p50 | ms p50 | ожидание GPU | VRAM p50 |
+|---|---|---|---|---|
+| `r21-a`: 94 % room + резерв `budget/4` | **5,4-5,9** | 169-186 | 147 мс | 7 854 МБ |
+| `r21-t1`: 94 % room + резерв 3 072 МБ | 7,7 | 126 | 81 мс | 7 804 МБ |
+| `r21-ctl`: политика базы (`line_for` 90 %, резерв 3 072 МБ) | **13,2-13,6** | 74-78 | 1,3 мс | 7 535 МБ |
+
+**Вывод: тюнинг старой базы на чистой базе — регрессия 2,2-2,5x.** При 96-97 % занятой карты лишние ~330-650 МБ резидентных текстур заставляют Direct3D 12 пейджить карту, и GPU встаёт (util 100 %, но 100 Вт и ожидание 147 мс). База сама держит ~768 МБ запаса именно под это. По AGENTS п.7 откат сделан тем же раундом; `VICTORY_TEXTURE_ROOM_PERCENT` и `VICTORY_CARD_ROOM_FOR_TARGETS_MB` остаются ручками для отдельных A/B (проверять на этой базе заново, вслепую из старой ветки не переносить).
+
+### 44.3. Шаг 2: подготовка без офлайн-PSO, сборка, харнесс
+
+- **Release** `cargo build --release -p victory` (x86-64-v3) — 48 с. Гейты: `cargo check --workspace` 0; `cargo test --workspace -- --test-threads=1` — все наборы `ok`, **~1 064 passed, 0 failed** (два GPU-теста `indirect::tests::warp_batch_charges_every_execution` и `indirect::tests::host_list_budget_starts_empty_at_each_submission` падают и на неизменённой базе — проверено `git stash`-ем правки; пропущены так же, как их пропускает CI).
+- **Шейдеры — только перевод, без единого `--pipelines`/`--preload`:** `victory.exe shaders --jobs 12` при `VICTORY_HOST_WAVE=32`, `VICTORY_VIEW_LIMIT=999999`: **25 760 переведено за 310 с**, 225 не переводятся (198 «контейнер без программы», 22 «no wave32 lowering», 5 «descriptor read as data») — в точности как в R16. Новая ревизия кэша — `%LOCALAPPDATA%\victory\cache\shaders` (~1,7 ГБ); `shaders-r18-water32` цел; старый `host-pipelines.bin` старой ветки убран в `cache\pipelines-main3060ti-archive`, новый не создавался офлайн.
+- **Библиотека PSO набирается только рантаймом:** за прогрев 240 с `host-pipelines.bin` = 9,2 МБ, к концу `r21-runA` = 21,1 МБ, `known-pipelines.bin` ~51 МБ. Ни одного признака артефактов prebuilt-PSO (§43.8) ни в одном прогоне.
+- **Харнесс переписан под чистую базу** (вне репо; снимки в `audit\round21\`): `run-road.ps1` — play.rs SETTINGS этой базы, 900 с, окно замера 720-900 с, тихий фон (без topmost/физ. ввода; только `VICTORY_KEYS`, `-AntiAfk`-пульсы `L`), captions каждую 1 с, `nvidia-smi` каждые 2 с, скриншоты окна каждые 15 с, в `version.txt`/`tag.txt` пишется драйвер. `launch-game.ps1` — через `victory play`: F1-меню/F3-панель, `-Res 1080to1440`, `-Dlss quality`, `-NoFrameGenReady` (FG на RTX 30 — NO-GO, и на 8 ГБ не держим под неё 1,5-2 ГБ), `VICTORY_STREAMLINE_DIR=C:\GTA6_Port\streamline\bin\x64`, следование одноразовому warm-up рестарту базы.
+
+### 44.4. Шаг 3: два тихих 15-минутных прогона до лодочного геймплея (окно 720-900 с)
+
+Строгий 1080p: `VICTORY_RENDER_1080P=1` (output 2560x1440, сцена 1920x1080), DLSS=0 или quality (сцена 1706x960 → DLSS SR), FrameGen выключен, `-AntiAfk`-маршрут: Enter 12..270 каждые 6 с, Right 300/360, L 420..840 каждые 60 с. Прогоны `road\r21-runA` и `road\r21-runB`.
+
+| окно 720-900 с | `runA` DLSS=0 | `runB` DLSS quality |
+|---|---|---|
+| fps p50 (p10-p90) | **12,40** (11,0-13,4) | **13,80** (10,8-14,5) |
+| ms p50 / p90 / p99 / max | 79,2 / 91,0 / 94,1 / 111,7 | 72,3 / 91,2 / 105,6 / **1 352,2** |
+| кадров >150 мс в окне | **0 из 36** | 1 из 35 (t≈764 с, draws 5 930 — переход/подгрузка сцены) |
+| draws p50 | 4 343 | 4 532 |
+| preparing / copies / textures | 38,8 / 13,0 / 1,3 мс | 38,8 / 12,5 / 1,0 мс |
+| ожидание GPU / copy-back | 27,0 / 14,8 мс | 11,1 / 16,0 мс |
+| dropped (без host-pipeline) | 104 | 142 |
+| VRAM p50 / peak | 7 854 / 7 919 МБ | 7 668 / 7 669 МБ |
+
+- **DLSS SR работает и не откатывается:** гейт в логе — «**1.00 upscalings by DLSS, 0.00 failed, 0.00 left to the title's FidelityFX**» (9 641 upscale за прогон), FG корректно off.
+- **Равные корзины draws (окно 350-905 с):** B быстрее на 1,03-1,15x (медиана ~1,09x): 3900: 72,4 → 67,0 мс; 4200: 76,6 → 69,3; 4500: 79,4 → 72,0; 4800: 82,3 → 74,2; p50 по окну 12,84 → 13,91 fps. VRAM: peak 7 947 → 7 669 МБ, mean 7 418 → 7 137 МБ (**−278 / −281 МБ**).
+- **Сцена — та самая лодочная миссия** («следуйте за самолётом»): скрины `artifacts\runA_boat_841.png` и `runB_dlss_boat_840.png` — один район (мост, мангры), 4 304/4 567 draws. **Артефактов «волн»/радуги нет** ни в одном прогоне — подтверждает вывод §43.8 (их давал только офлайн-prebuilt PSO).
+- Сверка с R16 (та же карта, но старый драйвер и изолированный профиль): A2 11,95 fps / 83,7 мс, B (DLSS) 13,28 / 75,3. Сейчас 12,40 / 79,2 и 13,80 / 72,3 при сопоставимых draws — **чистая база воспроизводит заявленные 11,95-13,28 fps** (окно и точка миссии чуть другие, поэтому сравниваем по draws-корзинам).
+- Артефакты 8-ГБ регрессии для отчёта: `artifacts\ctl_boat_405.png` (13-14 fps, политика базы) против `artifacts\run1_thrash_boat_855.png` (5 fps, наш 94-%-тюнинг, та же сцена).
+
+### 44.5. Что закреплено
+
+- **Ветка `nvidia-3060ti`** (5 коммитов, запушена в `myfork`); `main-3060ti` — `92783a6`, архив, не тронута. Обновления базы — только `git fetch nvidia` + `git merge nvidia/main` (AGENTS 11).
+- **AGENTS.md:** новые п.11 (чистая база/архив), 12 (офлайн-PSO запрещён навсегда, только `victory shaders`), 13 (строгий 1080p для 8 ГБ: `-Res 1080to1440` + `-NoFrameGenReady`, окно 900/720-900), 14 (старые кэши не удалять); п.10 переписан под собственный DLSS-движок базы.
+- **Профиль по умолчанию:** `launch-game.ps1` и `run-road.ps1` — **DLSS quality** (лучший профиль: +9-11 % fps и −280 МБ VRAM против DLSS off), честный 1080p-рендер, без FrameGen. Бюджеты — **политика базы** (90 %/3 072 МБ), наш старый тюнинг не закреплён.
+- **Подготовка:** библиотека PSO только рантаймом; шейдеры один раз `victory shaders --jobs 12`; драйвер пишется в тег прогона и HANDOFF.
+
+### 44.6. План Раунда 22
+
+1. **Обновление базы:** `git fetch nvidia` + `merge nvidia/main` (или отобранных PR); ручной порт больше не нужен.
+2. **8-ГБ PR-кандидаты** (каждый отдельным коммитом + A/B в окне 720-900): #196 (лёгкий профиль 8 ГБ/16 ГБ RAM), #168 (текстурный catch-up/64-мс пассы/не держать room под targets — их 4x меньше кадров >150 мс), #293, #399, #423.
+3. **Единичный 1,35-с кадр** в `runB` (t≈764 с, draws 5 930): найти причину (PSO/подгрузка при смене сцены) — это единственный фриз >150 мс за окно в обоих прогонах.
+4. **Вода** — отдельный раунд с `victory-shader` (#45 paired-Wave32 + tile-lists), новая ревизия кэша, старые не удалять.
+5. Глазами сверить картинку с PS5 Pro-референсом (`ref_ps5pro_water_scene.png`), особенно воду (у базы она тоже тёмно-синяя, §39.5).
+6. Обновить список репозиториев в AGENTS (`Belobug/VIctory-Belobug-AMD` — 404).
+
+### 44.7. Артефакты раунда
+
+- `audit\round21\`: `radar.md`/`radar2.md`, `shaders.log` (310 с, 25 760/225), `build-release.log`, `check.log`, `test.log`, `test-revert.log`, `run-nvidia21.ps1`, `r21-frames.ps1`, `r21-compare.ps1`, `harness-run-road-r21.ps1` и `launch-game-r21.ps1` (снимки рабочих скриптов), `run-road-main3060ti.ps1.bak`/`launch-game-main3060ti.ps1.bak` (старые), `artifacts\` (runA_boat_841, runB_dlss_boat_840, ctl_boat_405, run1_thrash_boat_855).
+- Прогоны в `road\`: `r21-warm` (240 с прогрев), `r21-a` (900 с, тюнинг — регрессия), `r21-ctl` (480 с, базовая политика), `r21-t1` (480 с, 94 %+3072), `r21-runA` (900 с, DLSS=0, финал), `r21-runB` (900 с, DLSS quality, финал).
